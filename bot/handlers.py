@@ -10,10 +10,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from bot.models import Target, SavedCommunity, ProxyAccount, engine, get_target, save_target, get_saved_communities, save_cookie, get_cookie, create_db_and_tables, save_proxy, get_proxy, clear_proxy, save_proxy_list, get_proxy_accounts, clear_all_proxies, parse_residential_proxy
-from bot.scheduler import TwitterTracker
+from bot.scheduler import CommunityScheduler
 from bot.twitter_api import TwitterAPI
 
 # Configure logging
@@ -51,7 +51,8 @@ def initialize_globals():
     """Initialize global variables"""
     global twitter_api, tracker
     twitter_api = get_twitter_api()
-    tracker = TwitterTracker(bot=bot, twitter_api=twitter_api)
+    tracker = CommunityScheduler(twitter_api)
+    tracker.set_bot(bot)
 
 # Define FSM states
 class BotStates(StatesGroup):
@@ -163,14 +164,26 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
         )
     
     elif action == "set_cookie":
-        await state.set_state(BotStates.waiting_for_cookie)
+        # Show cookie upload method selection
+        instructions = twitter_api.get_cookie_upload_methods()
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔧 Manual Method", callback_data="cookie_method:manual")],
+            [InlineKeyboardButton(text="🚀 Auto-Enriched (Recommended)", callback_data="cookie_method:auto")],
+            [InlineKeyboardButton(text="📥 Browser Export", callback_data="cookie_method:export")],
+            [InlineKeyboardButton(text="📋 View Saved Cookies", callback_data="cookie_method:list")],
+            [InlineKeyboardButton(text="🔙 Back", callback_data="action:back")]
+        ])
+        
         await callback_query.message.edit_text(
-            "Please enter your Twitter authentication cookie string.\n\n"
-            "Format: `auth_token=...; ct0=...;`\n\n"
-            "This will be used to authenticate with Twitter's API.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Cancel", callback_data="action:back")]
-            ])
+            "🍪 **Cookie Upload Methods**\n\n"
+            "Choose your preferred method for uploading Twitter cookies:\n\n"
+            "🔧 **Manual**: Copy auth_token + ct0 only\n"
+            "🚀 **Auto-Enriched**: Bot generates missing cookies automatically\n"
+            "📥 **Browser Export**: Upload JSON export from browser\n"
+            "📋 **View Saved**: Manage previously saved cookies",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
         )
     
     elif action == "proxy_menu":
@@ -311,8 +324,8 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
                 f"Target: @{target.screen_name}\n"
                 f"Cookie: {cookie_status}\n"
                 f"Proxies: {proxy_status}\n"
-                f"Tracking: {'Active' if tracker.job else 'Inactive'}\n"
-                f"Interval: {tracker.interval or 'Not set'} min\n"
+                f"Tracking: {'Active' if tracker.is_active() else 'Inactive'}\n"
+                f"Interval: {tracker.interval_minutes or 'Not set'} min\n"
                 f"Last run: {tracker.last_run.strftime('%Y-%m-%d %H:%M:%SZ') if tracker.last_run else 'Never'}\n"
                 f"Communities: {len(communities)}"
             )
@@ -366,7 +379,7 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
         
         try:
             # Manually check communities once
-            await tracker.check_communities(target.user_id)
+            await tracker.check_communities(target.screen_name)
             
             # Get updated communities
             with Session(engine) as session:
@@ -484,49 +497,222 @@ async def process_target_input(message: types.Message, state: FSMContext):
             reply_markup=get_main_keyboard()
         )
 
+@dp.callback_query(lambda c: c.data.startswith("cookie_method:"))
+async def process_cookie_method_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    """Process cookie method selection"""
+    await callback_query.answer()
+    method = callback_query.data.split(":")[1]
+    
+    if method == "manual":
+        await state.set_state(BotStates.waiting_for_cookie)
+        await state.update_data(cookie_method="manual")
+        
+        instructions = twitter_api.get_cookie_upload_methods()
+        
+        await callback_query.message.edit_text(
+            f"🔧 **Manual Cookie Method**\n\n"
+            f"{instructions['method1_manual']}\n\n"
+            f"Please paste your cookies in the format:\n"
+            f"`auth_token=abc123...; ct0=def456...;`\n\n"
+            f"⚠️ **Your message will be deleted immediately for security**",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Cancel", callback_data="action:set_cookie")]
+            ]),
+            parse_mode="Markdown"
+        )
+    
+    elif method == "auto":
+        await state.set_state(BotStates.waiting_for_cookie)
+        await state.update_data(cookie_method="auto")
+        
+        instructions = twitter_api.get_cookie_upload_methods()
+        
+        await callback_query.message.edit_text(
+            f"🚀 **Auto-Enriched Method (Recommended)**\n\n"
+            f"{instructions['method2_enriched']}\n\n"
+            f"Just paste the essential cookies:\n"
+            f"`auth_token=abc123...; ct0=def456...;`\n\n"
+            f"✨ Bot will automatically generate:\n"
+            f"• guest_id\n"
+            f"• personalization_id\n"
+            f"• guest_id_ads\n"
+            f"• guest_id_marketing\n\n"
+            f"⚠️ **Your message will be deleted immediately for security**",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Cancel", callback_data="action:set_cookie")]
+            ]),
+            parse_mode="Markdown"
+        )
+    
+    elif method == "export":
+        await state.set_state(BotStates.waiting_for_cookie)
+        await state.update_data(cookie_method="export")
+        
+        instructions = twitter_api.get_cookie_upload_methods()
+        
+        await callback_query.message.edit_text(
+            f"📥 **Browser Export Method**\n\n"
+            f"{instructions['browser_export']}\n\n"
+            f"Export cookies as JSON array from browser extensions.\n"
+            f"The bot will automatically extract Twitter cookies.\n\n"
+            f"⚠️ **Your message will be deleted immediately for security**",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Cancel", callback_data="action:set_cookie")]
+            ]),
+            parse_mode="Markdown"
+        )
+    
+    elif method == "list":
+        # Show saved cookies
+        saved_cookies = twitter_api.list_saved_cookies()
+        
+        if not saved_cookies:
+            await callback_query.message.edit_text(
+                "📋 **No Saved Cookies**\n\n"
+                "You haven't saved any cookie sets yet.\n"
+                "Upload cookies first to save them for later use.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 Back", callback_data="action:set_cookie")]
+                ])
+            )
+            return
+        
+        # Create keyboard with saved cookies
+        keyboard = []
+        for cookie_info in saved_cookies[:10]:  # Limit to 10 most recent
+            name = cookie_info['name']
+            preview = cookie_info['auth_token_preview']
+            keyboard.append([InlineKeyboardButton(
+                text=f"🍪 {name} ({preview})", 
+                callback_data=f"load_cookie:{name}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton(text="🔙 Back", callback_data="action:set_cookie")])
+        
+        cookie_list = "\n".join([
+            f"• **{info['name']}** ({info['auth_token_preview']})\n"
+            f"  Created: {info['created_at'][:10]}\n"
+            f"  Last used: {info['last_used'][:10]}"
+            for info in saved_cookies[:5]
+        ])
+        
+        await callback_query.message.edit_text(
+            f"📋 **Saved Cookie Sets**\n\n"
+            f"{cookie_list}\n\n"
+            f"Click on a cookie set to load it:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+            parse_mode="Markdown"
+        )
+
+@dp.callback_query(lambda c: c.data.startswith("load_cookie:"))
+async def process_load_cookie_callback(callback_query: types.CallbackQuery):
+    """Process loading saved cookies"""
+    await callback_query.answer()
+    cookie_name = callback_query.data.split(":", 1)[1]
+    
+    loading_msg = await callback_query.message.edit_text(
+        f"Loading cookie set: {cookie_name}..."
+    )
+    
+    try:
+        success = await twitter_api.load_saved_cookies(cookie_name)
+        
+        if success:
+            await loading_msg.edit_text(
+                f"✅ **Cookie Set Loaded Successfully**\n\n"
+                f"Loaded: **{cookie_name}**\n"
+                f"Status: Active and ready for tracking\n\n"
+                f"You can now start tracking Twitter users!",
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
+            )
+        else:
+            await loading_msg.edit_text(
+                f"❌ **Failed to Load Cookie Set**\n\n"
+                f"Cookie set '{cookie_name}' could not be loaded.\n"
+                f"It may be corrupted or expired.\n\n"
+                f"Please upload fresh cookies.",
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
+            )
+            
+    except Exception as e:
+        await loading_msg.edit_text(
+            f"❌ **Error Loading Cookies**\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please try again or upload fresh cookies.",
+            reply_markup=get_main_keyboard()
+        )
+
 @dp.message(BotStates.waiting_for_cookie)
 async def process_cookie_input(message: types.Message, state: FSMContext):
-    """Process cookie input"""
+    """Process enhanced cookie input with multiple methods"""
+    # Get method from state
+    data = await state.get_data()
+    method = data.get('cookie_method', 'auto')  # Default to auto
+    
     # Clear the waiting state
     await state.clear()
     
-    # Store the cookie
-    cookie_str = message.text
+    # Store the cookie input
+    cookie_input = message.text
     
     # Delete the message containing the cookie for security
     await message.delete()
     
     # Show loading message
-    loading_msg = await message.answer("Validating cookie...")
+    loading_msg = await message.answer("🔄 Processing cookies...")
     
     try:
-        # Get current proxy for cookie validation
-        current_proxy = get_proxy()
+        # Use enhanced cookie processing
+        result = await twitter_api.add_account_from_cookie_enhanced(
+            cookie_input=cookie_input,
+            method=method,
+            account_name=f"telegram_user_{message.from_user.id}"
+        )
         
-        # Validate cookie by adding account to twscrape
-        success = await twitter_api.add_account_from_cookie(cookie_str, proxy=current_proxy)
+        await loading_msg.delete()
         
-        if success:
-            # Save cookie
-            save_cookie(cookie_str)
+        if result['success']:
+            # Success message with details
+            method_desc = {
+                'manual': 'Manual Extraction',
+                'auto': 'Auto-Enriched',
+                'export': 'Browser Export'
+            }.get(method, 'Auto-Enriched')
             
-            await loading_msg.delete()
-            proxy_info = f"\nUsing proxy: {current_proxy[:50]}{'...' if current_proxy and len(current_proxy) > 50 else ''}" if current_proxy else "\nNo proxy used"
+            enrichment_note = " with auto-generated tokens" if result.get('enriched') else ""
+            
             await message.answer(
-                "Cookie set successfully! ✅\n\n"
-                f"Your authentication cookie has been stored securely.{proxy_info}",
-                reply_markup=get_main_keyboard()
+                f"✅ **Cookies Set Successfully!**\n\n"
+                f"Method: {method_desc}{enrichment_note}\n"
+                f"Saved as: {result.get('saved_as', 'N/A')}\n\n"
+                f"🔐 Your authentication is now active and ready for tracking!\n"
+                f"🚀 You can now start monitoring Twitter communities.",
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
             )
         else:
-            await loading_msg.delete()
+            # Error message with specific details
             await message.answer(
-                "Invalid cookie format. Please ensure it contains auth_token and ct0.",
-                reply_markup=get_main_keyboard()
+                f"❌ **Cookie Processing Failed**\n\n"
+                f"Method: {method}\n"
+                f"Error: {result['message']}\n\n"
+                f"💡 **Troubleshooting:**\n"
+                f"• Ensure you copied both auth_token AND ct0\n"
+                f"• Get fresh cookies from your browser\n"
+                f"• Try the Auto-Enriched method\n"
+                f"• Check that cookies aren't expired",
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
             )
+            
     except Exception as e:
         await loading_msg.delete()
         await message.answer(
-            f"Error validating cookie: {str(e)}",
+            f"❌ **Unexpected Error**\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please try again with fresh cookies.",
             reply_markup=get_main_keyboard()
         )
 
@@ -606,7 +792,9 @@ async def process_interval_callback(callback_query: types.CallbackQuery):
         return
     
     # Start tracking job
-    tracker.start(target.user_id, interval, callback_query.message.chat.id)
+    tracker.set_notification_chat(callback_query.message.chat.id)
+    tracker.interval_minutes = interval
+    await tracker.start(target.screen_name)
     
     await callback_query.message.edit_text(
         f"Polling every {interval} min...\n"
