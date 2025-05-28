@@ -12,7 +12,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from sqlmodel import Session
 
-from bot.models import Target, SavedCommunity, engine, get_target, save_target, get_saved_communities, save_cookie, get_cookie, create_db_and_tables
+from bot.models import Target, SavedCommunity, ProxyAccount, engine, get_target, save_target, get_saved_communities, save_cookie, get_cookie, create_db_and_tables, save_proxy, get_proxy, clear_proxy, save_proxy_list, get_proxy_accounts, clear_all_proxies, parse_residential_proxy
 from bot.scheduler import TwitterTracker
 from bot.twitter_api import TwitterAPI
 
@@ -31,16 +31,34 @@ bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Initialize Twitter API
-twitter_api = TwitterAPI()
+# Function to get TwitterAPI instance with current proxy configuration
+def get_twitter_api():
+    """Get TwitterAPI instance with current proxy configuration"""
+    proxy_accounts = get_proxy_accounts()
+    if proxy_accounts:
+        # Use database proxy rotation
+        return TwitterAPI()
+    else:
+        # Fallback to legacy proxy
+        proxy = get_proxy()
+        return TwitterAPI(proxy=proxy)
 
-# Initialize tracker
-tracker = TwitterTracker(bot=bot, twitter_api=twitter_api)
+# Global variables will be initialized after all functions are defined
+twitter_api = None
+tracker = None
+
+def initialize_globals():
+    """Initialize global variables"""
+    global twitter_api, tracker
+    twitter_api = get_twitter_api()
+    tracker = TwitterTracker(bot=bot, twitter_api=twitter_api)
 
 # Define FSM states
 class BotStates(StatesGroup):
     waiting_for_target = State()
     waiting_for_cookie = State()
+    waiting_for_proxy = State()
+    waiting_for_proxy_list = State()
 
 # Create main menu keyboard with inline buttons
 def get_main_keyboard():
@@ -48,10 +66,24 @@ def get_main_keyboard():
     builder.add(
         InlineKeyboardButton(text="📋 Set Target", callback_data="action:set_target"),
         InlineKeyboardButton(text="🍪 Set Cookie", callback_data="action:set_cookie"),
+        InlineKeyboardButton(text="🌐 Proxy Settings", callback_data="action:proxy_menu"),
         InlineKeyboardButton(text="▶️ Start Tracking", callback_data="action:start_tracking"),
         InlineKeyboardButton(text="⏹️ Stop Tracking", callback_data="action:stop_tracking"),
         InlineKeyboardButton(text="ℹ️ Status", callback_data="action:status"),
         InlineKeyboardButton(text="📊 Communities", callback_data="action:communities")
+    )
+    builder.adjust(2)  # 2 buttons per row
+    return builder.as_markup()
+
+# Create proxy management keyboard
+def get_proxy_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(text="🌐 Set Single Proxy", callback_data="action:set_proxy"),
+        InlineKeyboardButton(text="📋 Set Proxy List", callback_data="action:set_proxy_list"),
+        InlineKeyboardButton(text="👁️ View Proxies", callback_data="action:view_proxies"),
+        InlineKeyboardButton(text="🗑️ Clear All Proxies", callback_data="action:clear_proxies"),
+        InlineKeyboardButton(text="🔙 Back", callback_data="action:back")
     )
     builder.adjust(2)  # 2 buttons per row
     return builder.as_markup()
@@ -141,6 +173,89 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
             ])
         )
     
+    elif action == "proxy_menu":
+        proxy_accounts = get_proxy_accounts()
+        proxy_count = len(proxy_accounts)
+        await callback_query.message.edit_text(
+            f"Proxy Management\n\n"
+            f"Active proxies: {proxy_count}\n"
+            f"Residential proxy format supported\n\n"
+            f"Choose an option:",
+            reply_markup=get_proxy_keyboard()
+        )
+    
+    elif action == "set_proxy_list":
+        await state.set_state(BotStates.waiting_for_proxy_list)
+        await callback_query.message.edit_text(
+            "Please send your proxy list (one proxy per line).\n\n"
+            "Supported formats:\n"
+            "• Residential: `host:port:username:password`\n"
+            "• HTTP with auth: `http://user:pass@host:port`\n"
+            "• SOCKS5: `socks5://user:pass@host:port`\n"
+            "• Simple: `host:port`\n\n"
+            "Example residential proxy:\n"
+            "`quality.proxywing.com:8888:pkg-private2-country-us-session-Do8WkypR:mfu9i9s0zyj6tibs`",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Cancel", callback_data="action:proxy_menu")]
+            ])
+        )
+    
+    elif action == "view_proxies":
+        proxy_accounts = get_proxy_accounts()
+        if not proxy_accounts:
+            await callback_query.message.edit_text(
+                "No proxies configured.\n\nAdd some proxies first.",
+                reply_markup=get_proxy_keyboard()
+            )
+            return
+        
+        proxy_text = "🌐 **Active Proxies:**\n\n"
+        for i, proxy in enumerate(proxy_accounts[:10]):  # Show first 10
+            last_used = proxy.last_used_at.strftime('%H:%M') if proxy.last_used_at else 'Never'
+            proxy_preview = proxy.proxy_string[:40] + "..." if len(proxy.proxy_string) > 40 else proxy.proxy_string
+            proxy_text += f"{i+1}. `{proxy_preview}`\n   Last used: {last_used}\n\n"
+        
+        if len(proxy_accounts) > 10:
+            proxy_text += f"... and {len(proxy_accounts) - 10} more proxies"
+        
+        await callback_query.message.edit_text(
+            proxy_text,
+            reply_markup=get_proxy_keyboard()
+        )
+    
+    elif action == "clear_proxies":
+        clear_all_proxies()
+        # Also clear legacy proxy file
+        try:
+            os.remove("data/proxy.txt")
+        except FileNotFoundError:
+            pass
+        
+        # Reinitialize TwitterAPI without proxy
+        initialize_globals()
+        
+        await callback_query.message.edit_text(
+            "All proxies cleared! ✅\n\n"
+            "Proxy accounts have been removed from the database.\n"
+            "TwitterAPI reinitialized without proxy.",
+            reply_markup=get_proxy_keyboard()
+        )
+    
+    elif action == "set_proxy":
+        await state.set_state(BotStates.waiting_for_proxy)
+        await callback_query.message.edit_text(
+            "Please enter your proxy URL (single proxy mode).\n\n"
+            "Supported formats:\n"
+            "• HTTP: `http://user:pass@proxy:port`\n"
+            "• SOCKS5: `socks5://user:pass@proxy:port`\n"
+            "• Residential: `host:port:username:password`\n"
+            "• Without auth: `http://proxy:port`\n\n"
+            "Send 'clear' to remove current proxy.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Cancel", callback_data="action:proxy_menu")]
+            ])
+        )
+    
     elif action == "start_tracking":
         with Session(engine) as session:
             target = get_target(session)
@@ -178,13 +293,24 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
             target = get_target(session)
             communities = get_saved_communities(session)
         
+        proxy_accounts = get_proxy_accounts()
+        legacy_proxy = get_proxy()
+        
         if not target:
             status_text = "No target set. Please set a target first."
         else:
             cookie_status = "✅ Set" if get_cookie() else "❌ Not set"
+            if proxy_accounts:
+                proxy_status = f"✅ {len(proxy_accounts)} proxies in rotation"
+            elif legacy_proxy:
+                proxy_status = "✅ Single proxy set"
+            else:
+                proxy_status = "❌ Not set"
+            
             status_text = (
                 f"Target: @{target.screen_name}\n"
                 f"Cookie: {cookie_status}\n"
+                f"Proxies: {proxy_status}\n"
                 f"Tracking: {'Active' if tracker.job else 'Inactive'}\n"
                 f"Interval: {tracker.interval or 'Not set'} min\n"
                 f"Last run: {tracker.last_run.strftime('%Y-%m-%d %H:%M:%SZ') if tracker.last_run else 'Never'}\n"
@@ -374,17 +500,21 @@ async def process_cookie_input(message: types.Message, state: FSMContext):
     loading_msg = await message.answer("Validating cookie...")
     
     try:
+        # Get current proxy for cookie validation
+        current_proxy = get_proxy()
+        
         # Validate cookie by adding account to twscrape
-        success = await twitter_api.add_account_from_cookie(cookie_str)
+        success = await twitter_api.add_account_from_cookie(cookie_str, proxy=current_proxy)
         
         if success:
             # Save cookie
             save_cookie(cookie_str)
             
             await loading_msg.delete()
+            proxy_info = f"\nUsing proxy: {current_proxy[:50]}{'...' if current_proxy and len(current_proxy) > 50 else ''}" if current_proxy else "\nNo proxy used"
             await message.answer(
                 "Cookie set successfully! ✅\n\n"
-                "Your authentication cookie has been stored securely.",
+                f"Your authentication cookie has been stored securely.{proxy_info}",
                 reply_markup=get_main_keyboard()
             )
         else:
@@ -398,6 +528,63 @@ async def process_cookie_input(message: types.Message, state: FSMContext):
         await message.answer(
             f"Error validating cookie: {str(e)}",
             reply_markup=get_main_keyboard()
+        )
+
+@dp.message(BotStates.waiting_for_proxy)
+async def process_proxy_input(message: types.Message, state: FSMContext):
+    """Process proxy input"""
+    # Clear the waiting state
+    await state.clear()
+    
+    # Store the proxy
+    proxy_str = message.text
+    
+    # Delete the message containing the proxy for security
+    await message.delete()
+    
+    # Show loading message
+    loading_msg = await message.answer("Validating proxy...")
+    
+    try:
+        # Validate proxy
+        if proxy_str.lower() == "clear":
+            clear_proxy()
+            clear_all_proxies()  # Also clear proxy rotation
+            # Reinitialize TwitterAPI without proxy
+            initialize_globals()
+            await loading_msg.delete()
+            await message.answer(
+                "All proxies removed successfully! ✅\n\n"
+                "TwitterAPI reinitialized without proxy.",
+                reply_markup=get_proxy_keyboard()
+            )
+        else:
+            # Parse residential proxy format if needed
+            parsed_proxy = parse_residential_proxy(proxy_str)
+            
+            # Basic proxy format validation
+            if not (parsed_proxy.startswith('http://') or parsed_proxy.startswith('https://') or parsed_proxy.startswith('socks5://')):
+                raise ValueError("Invalid proxy format. Must be residential format (host:port:user:pass) or start with http://, https://, or socks5://")
+            
+            # Save proxy to both filesystem and database
+            save_proxy(parsed_proxy)
+            
+            # Reinitialize TwitterAPI with the new proxy
+            initialize_globals()
+            
+            await loading_msg.delete()
+            proxy_preview = parsed_proxy[:50] + "..." if len(parsed_proxy) > 50 else parsed_proxy
+            await message.answer(
+                "Single proxy set successfully! ✅\n\n"
+                f"Active proxy: `{proxy_preview}`\n\n"
+                "Proxy has been saved to database and will persist across restarts.",
+                reply_markup=get_proxy_keyboard()
+            )
+    except Exception as e:
+        await loading_msg.delete()
+        await message.answer(
+            f"Error validating proxy: {str(e)}",
+            reply_markup=get_proxy_keyboard()
         )
 
 @dp.callback_query(lambda c: c.data.startswith("interval:"))
@@ -469,16 +656,84 @@ async def process_community_callback(callback_query: types.CallbackQuery):
             reply_markup=builder.as_markup()
         )
 
+@dp.message(BotStates.waiting_for_proxy_list)
+async def process_proxy_list_input(message: types.Message, state: FSMContext):
+    """Process proxy list input"""
+    # Clear the waiting state
+    await state.clear()
+    
+    # Store the proxy list
+    proxy_list_text = message.text
+    
+    # Delete the message containing the proxy list for security
+    await message.delete()
+    
+    # Show loading message
+    loading_msg = await message.answer("Processing proxy list...")
+    
+    try:
+        # Validate and save proxy list
+        if not proxy_list_text.strip():
+            raise ValueError("Empty proxy list provided")
+        
+        proxy_lines = [line.strip() for line in proxy_list_text.strip().split('\n') if line.strip()]
+        
+        if not proxy_lines:
+            raise ValueError("No valid proxy lines found")
+        
+        # Basic validation for each proxy
+        for i, proxy_line in enumerate(proxy_lines):
+            parsed = parse_residential_proxy(proxy_line)
+            if not parsed:
+                raise ValueError(f"Invalid proxy format on line {i+1}: {proxy_line}")
+        
+        # Save proxy list to database
+        save_proxy_list(proxy_list_text)
+        
+        # Reinitialize TwitterAPI with proxy rotation support
+        initialize_globals()
+        
+        await loading_msg.delete()
+        await message.answer(
+            f"Proxy list set successfully! ✅\n\n"
+            f"Added {len(proxy_lines)} proxies to rotation.\n"
+            f"TwitterAPI will now use proxy rotation.\n"
+            f"All proxies are saved to database and will persist across restarts.",
+            reply_markup=get_proxy_keyboard()
+        )
+    except Exception as e:
+        await loading_msg.delete()
+        await message.answer(
+            f"Error processing proxy list: {str(e)}",
+            reply_markup=get_proxy_keyboard()
+        )
+
 async def on_startup():
     """Startup actions"""
     # Create database tables
     create_db_and_tables()
+    
+    # Reinitialize TwitterAPI with current proxy configuration
+    initialize_globals()
+    
+    # Log proxy status
+    proxy_accounts = get_proxy_accounts()
+    if proxy_accounts:
+        logging.info(f"Bot started with {len(proxy_accounts)} proxies in rotation")
+    else:
+        legacy_proxy = get_proxy()
+        if legacy_proxy:
+            logging.info(f"Bot started with legacy proxy: {legacy_proxy[:30]}...")
+        else:
+            logging.info("Bot started without proxy")
+    
     logging.info("Bot started")
 
 async def on_shutdown():
     """Shutdown actions"""
     # Stop tracking job
-    tracker.stop()
+    if tracker:
+        tracker.stop()
     logging.info("Bot stopped")
 
 # Register startup and shutdown handlers
@@ -487,6 +742,9 @@ dp.shutdown.register(on_shutdown)
 
 # Main entry point
 async def main():
+    # Initialize global variables first
+    initialize_globals()
+    
     # Start the bot
     await dp.start_polling(bot)
 

@@ -32,6 +32,16 @@ class Run(SQLModel, table=True):
     left_ids: str = Field(default="[]")    # JSON string
     created_ids: str = Field(default="[]") # JSON string
 
+class ProxyAccount(SQLModel, table=True):
+    """Model for storing proxy-account mappings"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    proxy_string: str  # Raw proxy string as provided
+    proxy_url: str     # Formatted proxy URL for twscrape
+    account_name: str  # Identifier for the account
+    is_active: bool = Field(default=True)
+    added_at: datetime = Field(default_factory=datetime.utcnow)
+    last_used_at: Optional[datetime] = None
+
 # Pydantic models for API responses
 class Community(SQLModel):
     """Model for a Twitter community"""
@@ -119,7 +129,7 @@ def get_last_run(session: Session) -> Optional[Run]:
     statement = select(Run).order_by(Run.run_at.desc())
     return session.exec(statement).first()
 
-def save_cookie(session: Session, cookie: str):
+def save_cookie(cookie: str):
     """Save a cookie to the database"""
     # In a production environment, this should be encrypted
     # For this MVP, we'll store it in an environment variable or config file
@@ -133,3 +143,142 @@ def get_cookie() -> Optional[str]:
             return f.read().strip()
     except FileNotFoundError:
         return None
+
+def parse_residential_proxy(proxy_string: str) -> str:
+    """
+    Parse residential proxy format and convert to URL format
+    
+    Args:
+        proxy_string: Format like "host:port:username:password"
+        
+    Returns:
+        Formatted proxy URL like "http://username:password@host:port"
+    """
+    try:
+        proxy_string = proxy_string.strip()
+        
+        # If it's already a proper URL format, return as-is
+        if proxy_string.startswith(('http://', 'https://', 'socks5://', 'socks4://')):
+            return proxy_string
+        
+        parts = proxy_string.split(':')
+        if len(parts) == 4:
+            host, port, username, password = parts
+            return f"http://{username}:{password}@{host}:{port}"
+        elif len(parts) == 2:
+            host, port = parts
+            return f"http://{host}:{port}"
+        else:
+            # If we can't parse it, return as-is
+            return proxy_string
+    except Exception:
+        # If parsing fails, return as-is
+        return proxy_string
+
+def save_proxy_list(proxy_list: str):
+    """Save a list of proxies to the database"""
+    with Session(engine) as session:
+        # Clear existing proxies
+        existing_proxies = session.exec(select(ProxyAccount)).all()
+        for proxy in existing_proxies:
+            session.delete(proxy)
+        session.commit()
+        
+        # Parse and save new proxies
+        for i, proxy_line in enumerate(proxy_list.strip().split('\n')):
+            proxy_line = proxy_line.strip()
+            if proxy_line:
+                proxy_url = parse_residential_proxy(proxy_line)
+                proxy_account = ProxyAccount(
+                    proxy_string=proxy_line,
+                    proxy_url=proxy_url,
+                    account_name=f"account_{i+1}"
+                )
+                session.add(proxy_account)
+        
+        session.commit()
+
+def get_proxy_accounts() -> List[ProxyAccount]:
+    """Get all proxy accounts from database"""
+    with Session(engine) as session:
+        statement = select(ProxyAccount).where(ProxyAccount.is_active == True)
+        return session.exec(statement).all()
+
+def get_next_available_proxy() -> Optional[ProxyAccount]:
+    """Get the next available proxy for rotation"""
+    with Session(engine) as session:
+        # Get least recently used proxy
+        statement = select(ProxyAccount).where(ProxyAccount.is_active == True).order_by(
+            ProxyAccount.last_used_at.asc().nulls_first()
+        )
+        proxy = session.exec(statement).first()
+        return proxy
+
+def update_proxy_last_used(proxy_id: int):
+    """Update the last used time for a proxy"""
+    with Session(engine) as session:
+        proxy = session.get(ProxyAccount, proxy_id)
+        if proxy:
+            proxy.last_used_at = datetime.utcnow()
+            session.commit()
+
+def save_single_proxy(proxy_string: str) -> ProxyAccount:
+    """Save a single proxy to the database and return the ProxyAccount"""
+    with Session(engine) as session:
+        # Clear existing proxies
+        existing_proxies = session.exec(select(ProxyAccount)).all()
+        for proxy in existing_proxies:
+            session.delete(proxy)
+        session.commit()
+        
+        # Parse and save the single proxy
+        proxy_url = parse_residential_proxy(proxy_string)
+        proxy_account = ProxyAccount(
+            proxy_string=proxy_string,
+            proxy_url=proxy_url,
+            account_name="single_proxy"
+        )
+        session.add(proxy_account)
+        session.commit()
+        session.refresh(proxy_account)
+        return proxy_account
+
+def save_proxy(proxy: str):
+    """Save a single proxy to the filesystem AND database"""
+    # Save to filesystem for legacy compatibility
+    with open("data/proxy.txt", "w") as f:
+        f.write(proxy)
+    
+    # Also save to database
+    save_single_proxy(proxy)
+
+def get_proxy() -> Optional[str]:
+    """Get the proxy from database first, then filesystem as fallback"""
+    # Try database first
+    proxy_accounts = get_proxy_accounts()
+    if proxy_accounts:
+        return proxy_accounts[0].proxy_url
+    
+    # Fallback to filesystem
+    try:
+        with open("data/proxy.txt", "r") as f:
+            proxy = f.read().strip()
+            return proxy if proxy else None
+    except FileNotFoundError:
+        return None
+
+def clear_proxy():
+    """Clear all proxies from database and filesystem"""
+    clear_all_proxies()
+    try:
+        os.remove("data/proxy.txt")
+    except FileNotFoundError:
+        pass
+
+def clear_all_proxies():
+    """Clear all proxy accounts from database"""
+    with Session(engine) as session:
+        proxies = session.exec(select(ProxyAccount)).all()
+        for proxy in proxies:
+            session.delete(proxy)
+        session.commit()
