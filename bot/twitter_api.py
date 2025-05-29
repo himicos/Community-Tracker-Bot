@@ -14,9 +14,10 @@ from twscrape.logger import set_log_level
 from bot.models import Community, TwitterUserCommunityPayload, get_next_available_proxy, update_proxy_last_used, get_proxy_accounts
 from bot.cookie_manager import CookieManager, CookieSet
 from bot.enhanced_community_tracker import EnhancedCommunityTracker
+from bot.twitter_graphql import TwitterGraphQLCommunities
 
 class TwitterAPI:
-    """Enhanced Twitter API class with comprehensive cookie management and community tracking"""
+    """Enhanced Twitter API class with comprehensive cookie management, community tracking, and GraphQL integration"""
     
     def __init__(self, proxy: Optional[str] = None):
         # Initialize API with proxy if provided
@@ -43,11 +44,12 @@ class TwitterAPI:
         # Initialize accounts pool file
         self.accounts_db = "data/accounts.db"
         
-        # Initialize cookie manager and enhanced tracker
+        # Initialize cookie manager, enhanced tracker, and GraphQL integration
         self.cookie_manager = CookieManager()
         self.enhanced_tracker = EnhancedCommunityTracker(self.api, self.cookie_manager)
+        self.graphql = TwitterGraphQLCommunities(self.cookie_manager)
         
-        self.logger.info(f"TwitterAPI initialized with proxy: {proxy if proxy else 'None'}")
+        self.logger.info(f"TwitterAPI initialized with GraphQL support and proxy: {proxy if proxy else 'None'}")
     
     # ========================================
     # ENHANCED COOKIE MANAGEMENT
@@ -233,6 +235,129 @@ class TwitterAPI:
             Detailed change report with all detected changes
         """
         return await self.enhanced_tracker.track_community_changes(username, previous_communities, deep_scan=deep_scan)
+    
+    # ========================================
+    # GRAPHQL DIRECT COMMUNITY DETECTION
+    # ========================================
+    
+    async def get_user_communities_direct(self, username: str) -> Optional[TwitterUserCommunityPayload]:
+        """
+        Get user's actual community memberships using GraphQL API (DIRECT METHOD)
+        
+        This method attempts to get real community membership data rather than inferring
+        from tweets or other indirect methods.
+        
+        Args:
+            username: Twitter username (without @)
+            
+        Returns:
+            TwitterUserCommunityPayload with actual community memberships
+        """
+        self.logger.info(f"🔍 Getting DIRECT community memberships for @{username} via GraphQL")
+        
+        try:
+            result = await self.graphql.get_user_communities_direct(username)
+            
+            if result:
+                self.logger.info(f"✅ Direct GraphQL scan complete for @{username}: {len(result.communities)} actual memberships found")
+                
+                # Log detailed results
+                for i, community in enumerate(result.communities, 1):
+                    self.logger.info(f"  {i}. {community.name} (Role: {community.role}, ID: {community.id})")
+            else:
+                self.logger.warning(f"⚠️ No direct community data found for @{username}")
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error in direct GraphQL community detection: {e}")
+            return None
+    
+    async def track_community_changes_direct(self, username: str, previous_communities: List[Community]) -> Dict[str, Any]:
+        """
+        Track changes using direct GraphQL community detection
+        
+        This is the most accurate method for detecting:
+        - User joined a new community
+        - User left a community  
+        - User created a new community
+        
+        Args:
+            username: Twitter username (without @)
+            previous_communities: List of previously stored communities
+            
+        Returns:
+            Detailed change report with actual membership changes
+        """
+        self.logger.info(f"🔍 Tracking DIRECT community changes for @{username}")
+        
+        try:
+            result = await self.graphql.detect_community_changes_graphql(username, previous_communities)
+            
+            if result.get("has_changes"):
+                self.logger.info(f"✅ DIRECT changes detected for @{username}:")
+                if result.get("joined"):
+                    self.logger.info(f"  📈 Joined: {len(result['joined'])} communities")
+                if result.get("left"):
+                    self.logger.info(f"  📉 Left: {len(result['left'])} communities")
+                if result.get("created"):
+                    self.logger.info(f"  🆕 Created: {len(result['created'])} communities")
+            else:
+                self.logger.info(f"ℹ️ No direct community changes detected for @{username}")
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error tracking direct community changes: {e}")
+            return {"error": str(e)}
+    
+    async def get_user_communities_hybrid(self, username: str, prefer_direct: bool = True) -> Optional[TwitterUserCommunityPayload]:
+        """
+        Hybrid approach: Try direct GraphQL first, fallback to comprehensive detection
+        
+        Args:
+            username: Twitter username (without @)
+            prefer_direct: If True, try GraphQL first; if False, try comprehensive first
+            
+        Returns:
+            Best available community data
+        """
+        self.logger.info(f"🔄 Using HYBRID community detection for @{username}")
+        
+        if prefer_direct:
+            # Try GraphQL first
+            self.logger.info("  🎯 Attempting direct GraphQL detection...")
+            result = await self.get_user_communities_direct(username)
+            
+            if result and len(result.communities) > 0:
+                self.logger.info(f"  ✅ Direct method succeeded: {len(result.communities)} communities")
+                return result
+            
+            # Fallback to comprehensive
+            self.logger.info("  🔄 Falling back to comprehensive detection...")
+            result = await self.get_user_communities_comprehensive(username, deep_scan=False)
+            
+            if result:
+                self.logger.info(f"  ✅ Comprehensive fallback succeeded: {len(result.communities)} communities")
+            
+            return result
+        else:
+            # Try comprehensive first
+            self.logger.info("  📊 Attempting comprehensive detection...")
+            result = await self.get_user_communities_comprehensive(username, deep_scan=True)
+            
+            if result and len(result.communities) > 0:
+                self.logger.info(f"  ✅ Comprehensive method succeeded: {len(result.communities)} communities")
+                return result
+            
+            # Fallback to direct
+            self.logger.info("  🔄 Falling back to direct GraphQL...")
+            result = await self.get_user_communities_direct(username)
+            
+            if result:
+                self.logger.info(f"  ✅ Direct fallback succeeded: {len(result.communities)} communities")
+            
+            return result
     
     # ========================================
     # LEGACY COMPATIBILITY METHODS

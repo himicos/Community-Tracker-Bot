@@ -138,6 +138,11 @@ class CommunityScheduler:
         """
         Enhanced community change detection with comprehensive monitoring
         
+        Uses multiple detection methods:
+        1. Traditional community detection (URLs, profiles, etc.)  
+        2. Post-based analysis for creation/joining indicators
+        3. Activity pattern analysis
+        
         Args:
             user_id: Twitter user ID or handle
         """
@@ -187,50 +192,65 @@ class CommunityScheduler:
             # Get previous community state from database
             previous_communities = self.db_manager.get_user_communities(user_id)
             
-            # Perform comprehensive community scan (deep scan for maximum detection)
-            self.logger.info(f"🚀 Starting comprehensive community scan for @{user_id}")
-            current_payload = await self.twitter_api.get_user_communities_comprehensive(
-                username=user_id, 
-                deep_scan=True  # Enable deep scanning for ALL communities
+            # Use ENHANCED tracking with post-based detection
+            self.logger.info(f"🎯 Starting enhanced community tracking for @{user_id}")
+            
+            # Initialize enhanced tracker if not available
+            if not hasattr(self.twitter_api, 'enhanced_tracker'):
+                from bot.enhanced_community_tracker import EnhancedCommunityTracker
+                self.twitter_api.enhanced_tracker = EnhancedCommunityTracker(
+                    self.twitter_api.api, self.twitter_api.cookie_manager
+                )
+            
+            # Use enhanced tracking with multiple detection methods
+            changes = await self.twitter_api.enhanced_tracker.track_community_changes(
+                username=user_id,
+                previous_communities=previous_communities,
+                deep_scan=True  # Enable all detection methods
             )
             
-            if not current_payload:
-                self.logger.error(f"Failed to fetch communities for @{user_id}")
+            if changes.get('error'):
+                self.logger.error(f"❌ Enhanced tracking failed for @{user_id}: {changes['error']}")
                 if self.chat_id:
                     await self.bot.send_message(
                         self.chat_id,
                         f"❌ **Tracking Error**\n\n"
                         f"Could not fetch community data for @{user_id}\n\n"
+                        f"Error: {changes['error']}\n\n"
                         f"Possible causes:\n"
                         f"• User doesn't exist or is suspended\n"
                         f"• Authentication expired\n"
-                        f"• Rate limits exceeded\n\n"
+                        f"• Twitter rate limits exceeded\n\n"
                         f"Will retry in next cycle.",
                         parse_mode="Markdown"
                     )
                 return
             
-            current_communities = current_payload.communities
+            # Calculate current communities
+            current_communities = []
+            current_communities.extend(changes.get('joined', []))
+            current_communities.extend(changes.get('created', []))
             
-            self.logger.info(f"📊 Community scan results for @{user_id}:")
+            # Add previous communities that weren't left
+            left_ids = {c.id for c in changes.get('left', [])}
+            remaining_previous = [c for c in previous_communities if c.id not in left_ids]
+            current_communities.extend(remaining_previous)
+            
+            self.logger.info(f"📊 Enhanced tracking results for @{user_id}:")
+            self.logger.info(f"   • Detection methods used: {changes.get('detection_methods', [])}")
             self.logger.info(f"   • Previous communities: {len(previous_communities)}")
             self.logger.info(f"   • Current communities: {len(current_communities)}")
+            self.logger.info(f"   • Changes detected: {len(changes.get('joined', [])) + len(changes.get('left', [])) + len(changes.get('created', []))}")
             
-            # Log all detected communities for verification
+            # Log detected communities with confidence scores
             if current_communities:
                 self.logger.info(f"🔍 All detected communities:")
                 for i, community in enumerate(current_communities, 1):
-                    self.logger.info(f"   {i}. {community.name} (ID: {community.id}, Role: {community.role})")
-            
-            # Track comprehensive changes
-            changes = await self.twitter_api.track_community_changes_comprehensive(
-                username=user_id,
-                previous_communities=previous_communities,
-                deep_scan=True
-            )
+                    confidence = changes.get('confidence_scores', {}).get(community.id, 'N/A')
+                    self.logger.info(f"   {i}. {community.name} (Role: {community.role}, Confidence: {confidence})")
             
             # Process and notify about changes
-            await self._process_comprehensive_changes(user_id, changes, current_communities)
+            await self._process_enhanced_changes(user_id, changes, current_communities)
             
             # Update database with new community state
             self.db_manager.update_user_communities(user_id, current_communities)
@@ -244,13 +264,17 @@ class CommunityScheduler:
                     self.chat_id,
                     f"❌ **Monitoring Error**\n\n"
                     f"Error monitoring @{user_id}: {str(e)}\n\n"
+                    f"This may indicate:\n"
+                    f"• Twitter API changes\n"
+                    f"• Authentication issues\n"
+                    f"• Network connectivity problems\n\n"
                     f"Monitoring will continue automatically.",
                     parse_mode="Markdown"
                 )
     
-    async def _process_comprehensive_changes(self, user_id: str, changes: Dict[str, Any], all_communities: List):
+    async def _process_enhanced_changes(self, user_id: str, changes: Dict[str, Any], all_communities: List):
         """
-        Process and notify about comprehensive community changes
+        Process and notify about enhanced community changes
         
         Args:
             user_id: Twitter username
@@ -291,10 +315,10 @@ class CommunityScheduler:
             self.logger.warning("No chat_id set - cannot send notifications")
             return
         
-        # Build comprehensive notification message
+        # Build enhanced notification message
         message_parts = [f"🔔 **Community Activity Detected**\n"]
         message_parts.append(f"User: @{user_id}")
-        message_parts.append(f"Scan type: {changes.get('scan_type', 'comprehensive')}")
+        message_parts.append(f"Scan type: {changes.get('scan_type', 'Enhanced Tracking')}")
         message_parts.append(f"Total changes: {total_changes}\n")
         
         # Joined communities
@@ -371,10 +395,10 @@ class CommunityScheduler:
                 parse_mode="Markdown"
             )
             
-            self.logger.info(f"📤 Comprehensive notification sent for @{user_id}")
+            self.logger.info(f"📤 Enhanced notification sent for @{user_id}")
             
         except Exception as e:
-            self.logger.error(f"Error sending comprehensive notification: {e}")
+            self.logger.error(f"Error sending enhanced notification: {e}")
             
             # Try sending without markdown if formatting fails
             try:

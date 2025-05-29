@@ -446,18 +446,48 @@ def get_last_run(session: Session) -> Optional[Run]:
     return session.exec(statement).first()
 
 def save_cookie(cookie: str):
-    """Save a cookie to the database"""
-    # In a production environment, this should be encrypted
-    # For this MVP, we'll store it in an environment variable or config file
-    with open("data/cookie.txt", "w") as f:
-        f.write(cookie)
+    """Save a cookie using the enhanced cookie manager system"""
+    try:
+        # Save using the new CookieManager system
+        from bot.cookie_manager import CookieManager
+        cookie_manager = CookieManager()
+        
+        # Parse the cookie string
+        cookie_set = cookie_manager.parse_manual_cookies(cookie)
+        if cookie_set:
+            # Save with a default name
+            cookie_manager.save_cookies(cookie_set, "default")
+        
+        # Also save to legacy file for backward compatibility
+        with open("data/cookie.txt", "w") as f:
+            f.write(cookie)
+    except Exception as e:
+        # Fallback to legacy save method
+        with open("data/cookie.txt", "w") as f:
+            f.write(cookie)
 
 def get_cookie() -> Optional[str]:
-    """Get the cookie from the database"""
+    """Get the cookie from the enhanced cookie manager system"""
     try:
+        # First check if we have cookies in the new CookieManager system
+        from bot.cookie_manager import CookieManager
+        cookie_manager = CookieManager()
+        
+        # Get list of saved cookies
+        saved_cookies = cookie_manager.list_cookie_sets()
+        if saved_cookies:
+            # Get the most recently used cookie set
+            latest_cookie = sorted(saved_cookies, key=lambda x: x['last_used'], reverse=True)[0]
+            cookie_set = cookie_manager.load_cookies(latest_cookie['name'])
+            if cookie_set:
+                return cookie_set.to_string()
+        
+        # Fallback to legacy cookie.txt file
         with open("data/cookie.txt", "r") as f:
             return f.read().strip()
     except FileNotFoundError:
+        return None
+    except Exception:
         return None
 
 def parse_residential_proxy(proxy_string: str) -> str:

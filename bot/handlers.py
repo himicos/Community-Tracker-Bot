@@ -178,7 +178,7 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
         await callback_query.message.edit_text(
             "🍪 **Cookie Upload Methods**\n\n"
             "Choose your preferred method for uploading Twitter cookies:\n\n"
-            "🔧 **Manual**: Copy auth_token + ct0 only\n"
+            "🔧 **Manual**: Copy auth\\_token + ct0 only\n"
             "🚀 **Auto-Enriched**: Bot generates missing cookies automatically\n"
             "📥 **Browser Export**: Upload JSON export from browser\n"
             "📋 **View Saved**: Manage previously saved cookies",
@@ -511,7 +511,13 @@ async def process_cookie_method_callback(callback_query: types.CallbackQuery, st
         
         await callback_query.message.edit_text(
             f"🔧 **Manual Cookie Method**\n\n"
-            f"{instructions['method1_manual']}\n\n"
+            f"1. Open Twitter/X in your browser and login\n"
+            f"2. Press F12 (Developer Tools)\n"
+            f"3. Go to Application/Storage tab\n"
+            f"4. Find Cookies → x.com\n"
+            f"5. Copy these cookies:\n"
+            f"   • auth\\_token (long hex string)\n"
+            f"   • ct0 (CSRF token, 32+ chars)\n\n"
             f"Please paste your cookies in the format:\n"
             f"`auth_token=abc123...; ct0=def456...;`\n\n"
             f"⚠️ **Your message will be deleted immediately for security**",
@@ -529,14 +535,20 @@ async def process_cookie_method_callback(callback_query: types.CallbackQuery, st
         
         await callback_query.message.edit_text(
             f"🚀 **Auto-Enriched Method (Recommended)**\n\n"
-            f"{instructions['method2_enriched']}\n\n"
+            f"1. Follow manual method to get auth\\_token and ct0\n"
+            f"2. Send just: auth\\_token=abc123...; ct0=def456...;\n"
+            f"3. Bot automatically generates:\n"
+            f"   • guest\\_id\n"
+            f"   • personalization\\_id\n"
+            f"   • guest\\_id\\_ads\n"
+            f"   • guest\\_id\\_marketing\n\n"
             f"Just paste the essential cookies:\n"
             f"`auth_token=abc123...; ct0=def456...;`\n\n"
             f"✨ Bot will automatically generate:\n"
-            f"• guest_id\n"
-            f"• personalization_id\n"
-            f"• guest_id_ads\n"
-            f"• guest_id_marketing\n\n"
+            f"• guest\\_id\n"
+            f"• personalization\\_id\n"
+            f"• guest\\_id\\_ads\n"
+            f"• guest\\_id\\_marketing\n\n"
             f"⚠️ **Your message will be deleted immediately for security**",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔙 Cancel", callback_data="action:set_cookie")]
@@ -552,9 +564,8 @@ async def process_cookie_method_callback(callback_query: types.CallbackQuery, st
         
         await callback_query.message.edit_text(
             f"📥 **Browser Export Method**\n\n"
-            f"{instructions['browser_export']}\n\n"
-            f"Export cookies as JSON array from browser extensions.\n"
-            f"The bot will automatically extract Twitter cookies.\n\n"
+            f"Export all cookies as JSON from browser extensions.\n"
+            f"Send the JSON array and bot will extract Twitter cookies automatically.\n\n"
             f"⚠️ **Your message will be deleted immediately for security**",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔙 Cancel", callback_data="action:set_cookie")]
@@ -600,8 +611,7 @@ async def process_cookie_method_callback(callback_query: types.CallbackQuery, st
             f"📋 **Saved Cookie Sets**\n\n"
             f"{cookie_list}\n\n"
             f"Click on a cookie set to load it:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
-            parse_mode="Markdown"
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
         )
 
 @dp.callback_query(lambda c: c.data.startswith("load_cookie:"))
