@@ -12,9 +12,17 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from sqlmodel import Session, select
 
-from bot.models import Target, SavedCommunity, ProxyAccount, engine, get_target, save_target, get_saved_communities, save_cookie, get_cookie, create_db_and_tables, save_proxy, get_proxy, clear_proxy, save_proxy_list, get_proxy_accounts, clear_all_proxies, parse_residential_proxy
+from bot.models import Target, SavedCommunity, ProxyAccount, engine, get_target, save_target, get_saved_communities, save_cookie, get_cookie, create_db_and_tables, save_proxy, get_proxy, clear_proxy, save_proxy_list, get_proxy_accounts, clear_all_proxies, parse_residential_proxy, save_communities
 from bot.scheduler import CommunityScheduler
 from bot.twitter_api import TwitterAPI
+
+# Try to import element detector if available
+try:
+    from bot.element_community_detector import ElementCommunityDetector
+    from bot.cookie_manager import CookieManager
+    ELEMENT_DETECTION_AVAILABLE = True
+except ImportError:
+    ELEMENT_DETECTION_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,14 +53,42 @@ def get_twitter_api():
 
 # Global variables will be initialized after all functions are defined
 twitter_api = None
-tracker = None
+scheduler = None
+_globals_initialized = False
 
 def initialize_globals():
     """Initialize global variables"""
-    global twitter_api, tracker
+    global twitter_api, scheduler, _globals_initialized
+    
+    # Prevent duplicate initialization
+    if _globals_initialized:
+        logging.info("Globals already initialized, skipping...")
+        return
+    
     twitter_api = get_twitter_api()
-    tracker = CommunityScheduler(twitter_api)
-    tracker.set_bot(bot)
+    scheduler = CommunityScheduler(twitter_api)
+    scheduler.set_bot(bot)
+    _globals_initialized = True
+    
+    # Initialize element detection if available
+    if ELEMENT_DETECTION_AVAILABLE:
+        global cookie_manager, element_detector
+        cookie_manager = CookieManager()
+        element_detector = ElementCommunityDetector(cookie_manager)
+
+def force_reinitialize_globals():
+    """Force reinitialize global variables (used when proxy settings change)"""
+    global twitter_api, scheduler, _globals_initialized
+    
+    logging.info("Force reinitializing globals due to proxy change...")
+    
+    # Stop existing scheduler if running
+    if scheduler and scheduler.is_active():
+        scheduler.stop()
+    
+    # Reset flag and reinitialize
+    _globals_initialized = False
+    initialize_globals()
 
 # Define FSM states
 class BotStates(StatesGroup):
@@ -245,7 +281,7 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
             pass
         
         # Reinitialize TwitterAPI without proxy
-        initialize_globals()
+        force_reinitialize_globals()
         
         await callback_query.message.edit_text(
             "All proxies cleared! ✅\n\n"
@@ -294,7 +330,7 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
         )
     
     elif action == "stop_tracking":
-        tracker.stop()
+        scheduler.stop()
         
         await callback_query.message.edit_text(
             "Tracking stopped.",
@@ -324,9 +360,9 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
                 f"Target: @{target.screen_name}\n"
                 f"Cookie: {cookie_status}\n"
                 f"Proxies: {proxy_status}\n"
-                f"Tracking: {'Active' if tracker.is_active() else 'Inactive'}\n"
-                f"Interval: {tracker.interval_minutes or 'Not set'} min\n"
-                f"Last run: {tracker.last_run.strftime('%Y-%m-%d %H:%M:%SZ') if tracker.last_run else 'Never'}\n"
+                f"Tracking: {'Active' if scheduler.is_active() else 'Inactive'}\n"
+                f"Interval: {scheduler.interval_minutes or 'Not set'} min\n"
+                f"Last run: {scheduler.last_run.strftime('%Y-%m-%d %H:%M:%SZ') if scheduler.last_run else 'Never'}\n"
                 f"Communities: {len(communities)}"
             )
         
@@ -378,8 +414,22 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
         )
         
         try:
-            # Manually check communities once
-            await tracker.check_communities(target.screen_name)
+            # Try element detection first if available
+            if ELEMENT_DETECTION_AVAILABLE:
+                try:
+                    communities = await element_detector.detect_communities(target.screen_name)
+                    if communities:
+                        result_message = element_detector.format_detection_results(communities, target.screen_name)
+                        await callback_query.message.edit_text(
+                            result_message,
+                            reply_markup=get_main_keyboard()
+                        )
+                        return
+                except Exception as e:
+                    logging.error(f"Element detection failed: {e}")
+            
+            # Fallback to original method
+            await scheduler.check_communities(target.screen_name)
             
             # Get updated communities
             with Session(engine) as session:
@@ -403,6 +453,17 @@ async def process_action_callback(callback_query: types.CallbackQuery, state: FS
             "Twitter Community Tracker Console\n\n"
             "Use the buttons below to control the bot:",
             reply_markup=get_main_keyboard()
+        )
+    
+    elif action == "main_menu":
+        # Clear any waiting states
+        await state.clear()
+        
+        await callback_query.message.edit_text(
+            "🏠 **Twitter Community Tracker Console**\n\n"
+            "Welcome back! Use the buttons below to control the bot:",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
         )
 
 @dp.callback_query(lambda c: c.data.startswith("target:"))
@@ -459,8 +520,8 @@ async def process_target_input(message: types.Message, state: FSMContext):
         # Add account from cookie if not already added
         await twitter_api.add_account_from_cookie(cookie)
         
-        # Get user info to validate
-        user_data = await twitter_api.get_user_communities(target_handle)
+        # Fast validation - just check if user exists and auth works (no community scanning)
+        user_data = await twitter_api.validate_user_and_auth(target_handle)
         
         if not user_data:
             await loading_msg.delete()
@@ -473,16 +534,32 @@ async def process_target_input(message: types.Message, state: FSMContext):
         # Save target to database
         with Session(engine) as session:
             target_obj = Target(
-                user_id=user_data.user_id,
-                screen_name=user_data.screen_name,
-                name=user_data.name or user_data.screen_name
+                user_id=user_data['user_id'],
+                screen_name=user_data['screen_name'],
+                name=user_data['name']
             )
             save_target(session, target_obj)
         
         await loading_msg.delete()
+        
+        # Show successful validation with scan options
+        scan_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Scan Communities Now", callback_data=f"scan_now:{target_handle}")],
+            [InlineKeyboardButton(text="⏰ Start Auto Monitoring", callback_data=f"start_monitoring:{target_handle}")],
+            [InlineKeyboardButton(text="⚙️ Configure Interval", callback_data="configure_interval")],
+            [InlineKeyboardButton(text="🔙 Main Menu", callback_data="action:main_menu")]
+        ])
+        
         await message.answer(
-            f"Target set: @{user_data.screen_name} (ID: {user_data.user_id})",
-            reply_markup=get_main_keyboard()
+            f"✅ **Target Validated Successfully**\n\n"
+            f"**User:** @{user_data['screen_name']}\n"
+            f"**Name:** {user_data['name']}\n"
+            f"**ID:** {user_data['user_id']}\n"
+            f"**Followers:** {user_data.get('followers_count', 'N/A')}\n"
+            f"**Verified:** {'✅' if user_data.get('verified') else '❌'}\n\n"
+            f"🎯 **What would you like to do next?**",
+            reply_markup=scan_keyboard,
+            parse_mode="Markdown"
         )
     except ValueError as e:
         await loading_msg.delete()
@@ -747,7 +824,7 @@ async def process_proxy_input(message: types.Message, state: FSMContext):
             clear_proxy()
             clear_all_proxies()  # Also clear proxy rotation
             # Reinitialize TwitterAPI without proxy
-            initialize_globals()
+            force_reinitialize_globals()
             await loading_msg.delete()
             await message.answer(
                 "All proxies removed successfully! ✅\n\n"
@@ -766,7 +843,7 @@ async def process_proxy_input(message: types.Message, state: FSMContext):
             save_proxy(parsed_proxy)
             
             # Reinitialize TwitterAPI with the new proxy
-            initialize_globals()
+            force_reinitialize_globals()
             
             await loading_msg.delete()
             proxy_preview = parsed_proxy[:50] + "..." if len(parsed_proxy) > 50 else parsed_proxy
@@ -802,9 +879,9 @@ async def process_interval_callback(callback_query: types.CallbackQuery):
         return
     
     # Start tracking job
-    tracker.set_notification_chat(callback_query.message.chat.id)
-    tracker.interval_minutes = interval
-    await tracker.start(target.screen_name)
+    scheduler.set_notification_chat(callback_query.message.chat.id)
+    scheduler.interval_minutes = interval
+    await scheduler.start(target.screen_name)
     
     await callback_query.message.edit_text(
         f"Polling every {interval} min...\n"
@@ -889,7 +966,7 @@ async def process_proxy_list_input(message: types.Message, state: FSMContext):
         save_proxy_list(proxy_list_text)
         
         # Reinitialize TwitterAPI with proxy rotation support
-        initialize_globals()
+        force_reinitialize_globals()
         
         await loading_msg.delete()
         await message.answer(
@@ -906,13 +983,309 @@ async def process_proxy_list_input(message: types.Message, state: FSMContext):
             reply_markup=get_proxy_keyboard()
         )
 
+@dp.callback_query(lambda c: c.data.startswith("scan_now:"))
+async def process_scan_now_callback(callback_query: types.CallbackQuery):
+    """Process immediate community scan request"""
+    await callback_query.answer()
+    username = callback_query.data.split(":", 1)[1]
+    
+    loading_msg = await callback_query.message.edit_text(
+        f"🌐 **Fast Community Scan for @{username}**\n\n"
+        f"Using browser automation + post analysis...\n"
+        f"(No social graph analysis for speed)"
+    )
+    
+    try:
+        # Perform lightweight community scan with timeout
+        scan_timeout = 30  # 30 seconds timeout (much faster now)
+        result = await asyncio.wait_for(
+            twitter_api.get_user_communities_comprehensive(username, deep_scan=False),
+            timeout=scan_timeout
+        )
+        
+        if not result:
+            await loading_msg.edit_text(
+                f"❌ **Scan Failed**\n\n"
+                f"Could not retrieve community data for @{username}.\n"
+                f"Please check authentication and try again.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+        
+        communities = result.communities
+        
+        if not communities:
+            await loading_msg.edit_text(
+                f"📊 **Scan Complete - No Communities Found**\n\n"
+                f"**User:** @{username}\n"
+                f"**Result:** No community memberships detected\n\n"
+                f"This could mean:\n"
+                f"• User is not in any communities\n"
+                f"• Communities are private\n"
+                f"• Detection method limitations\n\n"
+                f"Try auto-monitoring to detect future activity!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⏰ Start Monitoring", callback_data=f"start_monitoring:{username}")],
+                    [InlineKeyboardButton(text="🔙 Main Menu", callback_data="action:main_menu")]
+                ]),
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Format communities for display
+        community_text = []
+        admin_count = 0
+        member_count = 0
+        
+        for i, community in enumerate(communities[:10], 1):  # Limit display to 10
+            role_emoji = "👑" if community.role == "Admin" else "👤"
+            community_text.append(f"{i}. {role_emoji} **{community.name}**")
+            community_text.append(f"   Role: {community.role}")
+            
+            if community.role == "Admin":
+                admin_count += 1
+            else:
+                member_count += 1
+        
+        if len(communities) > 10:
+            community_text.append(f"\n... and {len(communities) - 10} more communities")
+        
+        communities_display = "\n".join(community_text)
+        
+        # Save communities to database to prevent false "new" alerts later
+        try:
+            with Session(engine) as session:
+                save_communities(session, username, communities)
+                
+            scheduler.db_manager.update_user_communities(username, communities)
+            
+        except Exception as save_error:
+            # Log but don't fail the scan if database save fails
+            logging.error(f"Failed to save communities to database: {save_error}")
+        
+        await loading_msg.edit_text(
+            f"✅ **Community Scan Complete**\n\n"
+            f"**User:** @{username}\n"
+            f"**Total Communities:** {len(communities)}\n"
+            f"**Admin/Creator:** {admin_count}\n"
+            f"**Member:** {member_count}\n\n"
+            f"**Communities Found:**\n{communities_display}\n\n"
+            f"🎯 **Next Steps:**",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏰ Start Monitoring", callback_data=f"start_monitoring:{username}")],
+                [InlineKeyboardButton(text="🔄 Rescan", callback_data=f"scan_now:{username}")],
+                [InlineKeyboardButton(text="🔙 Main Menu", callback_data="action:main_menu")]
+            ]),
+            parse_mode="Markdown"
+        )
+        
+    except asyncio.TimeoutError:
+        await loading_msg.edit_text(
+            f"⏰ **Scan Timeout**\n\n"
+            f"Community scan for @{username} took longer than {scan_timeout} seconds.\n\n"
+            f"This can happen with:\n"
+            f"• Heavy community activity\n"
+            f"• Browser automation delays\n"
+            f"• Network issues\n\n"
+            f"Try again or use monitoring instead.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Try Again", callback_data=f"scan_now:{username}")],
+                [InlineKeyboardButton(text="⏰ Start Monitoring", callback_data=f"start_monitoring:{username}")],
+                [InlineKeyboardButton(text="🔙 Main Menu", callback_data="action:main_menu")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+    except Exception as e:
+        await loading_msg.edit_text(
+            f"❌ **Scan Error**\n\n"
+            f"Error scanning @{username}: {str(e)}\n\n"
+            f"Please try again or contact support.",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
+
+@dp.callback_query(lambda c: c.data.startswith("start_monitoring:"))
+async def process_start_monitoring_callback(callback_query: types.CallbackQuery):
+    """Process start monitoring request"""
+    await callback_query.answer()
+    username = callback_query.data.split(":", 1)[1]
+    
+    # Check if monitoring is already active
+    if scheduler.is_active() and scheduler.target_user == username:
+        await callback_query.message.edit_text(
+            f"⚠️ **Already Monitoring**\n\n"
+            f"@{username} is already being monitored.\n"
+            f"Interval: {scheduler.interval_minutes} minutes\n\n"
+            f"Check logs for activity updates.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛑 Stop Monitoring", callback_data=f"stop_monitoring:{username}")],
+                [InlineKeyboardButton(text="⚙️ Change Interval", callback_data="configure_interval")],
+                [InlineKeyboardButton(text="🔙 Main Menu", callback_data="action:main_menu")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Start monitoring
+    try:
+        # Set notification chat
+        scheduler.set_notification_chat(callback_query.from_user.id)
+        
+        # Start monitoring
+        success = await scheduler.start(username)
+        
+        if success:
+            await callback_query.message.edit_text(
+                f"🎯 **Enhanced Community Monitoring Started**\n\n"
+                f"**Target:** @{username}\n"
+                f"**Interval:** {scheduler.interval_minutes} minutes\n"
+                f"**Features:** Deep scanning, comprehensive detection\n\n"
+                f"📡 Monitoring all community activities...\n\n"
+                f"You'll receive notifications when:\n"
+                f"• User joins new communities\n"
+                f"• User leaves communities\n"
+                f"• User creates communities\n"
+                f"• User's role changes\n\n"
+                f"⏰ Next check in {scheduler.interval_minutes} minutes",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🛑 Stop Monitoring", callback_data=f"stop_monitoring:{username}")],
+                    [InlineKeyboardButton(text="⚙️ Change Interval", callback_data="configure_interval")],
+                    [InlineKeyboardButton(text="📊 Check Status", callback_data="monitoring_status")],
+                    [InlineKeyboardButton(text="🔙 Main Menu", callback_data="action:main_menu")]
+                ]),
+                parse_mode="Markdown"
+            )
+        else:
+            await callback_query.message.edit_text(
+                f"❌ **Failed to Start Monitoring**\n\n"
+                f"Could not start monitoring for @{username}.\n"
+                f"Please check authentication and try again.",
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
+            )
+            
+    except Exception as e:
+        await callback_query.message.edit_text(
+            f"❌ **Monitoring Error**\n\n"
+            f"Error starting monitoring: {str(e)}",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
+
+@dp.callback_query(lambda c: c.data.startswith("stop_monitoring:"))
+async def process_stop_monitoring_callback(callback_query: types.CallbackQuery):
+    """Process stop monitoring request"""
+    await callback_query.answer()
+    username = callback_query.data.split(":", 1)[1]
+    
+    try:
+        scheduler.stop()
+        
+        await callback_query.message.edit_text(
+            f"🛑 **Monitoring Stopped**\n\n"
+            f"Stopped monitoring @{username}.\n"
+            f"You can restart monitoring anytime.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="▶️ Restart Monitoring", callback_data=f"start_monitoring:{username}")],
+                [InlineKeyboardButton(text="🔙 Main Menu", callback_data="action:main_menu")]
+            ]),
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        await callback_query.message.edit_text(
+            f"❌ **Error stopping monitoring:** {str(e)}",
+            reply_markup=get_main_keyboard()
+        )
+
+@dp.callback_query(lambda c: c.data == "configure_interval")
+async def process_configure_interval_callback(callback_query: types.CallbackQuery):
+    """Process interval configuration request"""
+    await callback_query.answer()
+    
+    interval_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ 1 minute", callback_data="set_interval:1")],
+        [InlineKeyboardButton(text="🔥 5 minutes", callback_data="set_interval:5")],
+        [InlineKeyboardButton(text="⏰ 15 minutes", callback_data="set_interval:15")],
+        [InlineKeyboardButton(text="📅 30 minutes", callback_data="set_interval:30")],
+        [InlineKeyboardButton(text="🕐 1 hour", callback_data="set_interval:60")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="action:main_menu")]
+    ])
+    
+    await callback_query.message.edit_text(
+        f"⚙️ **Configure Monitoring Interval**\n\n"
+        f"Current interval: **{scheduler.interval_minutes} minutes**\n\n"
+        f"Choose how often to check for community changes:\n\n"
+        f"⚡ **1 minute** - Very frequent (high Twitter usage)\n"
+        f"🔥 **5 minutes** - Frequent monitoring\n"
+        f"⏰ **15 minutes** - Balanced (recommended)\n"
+        f"📅 **30 minutes** - Less frequent\n"
+        f"🕐 **1 hour** - Minimal monitoring\n\n"
+        f"⚠️ Shorter intervals may hit rate limits faster.",
+        reply_markup=interval_keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(lambda c: c.data.startswith("set_interval:"))
+async def process_set_interval_callback(callback_query: types.CallbackQuery):
+    """Process interval setting"""
+    await callback_query.answer()
+    new_interval = int(callback_query.data.split(":", 1)[1])
+    
+    # Update scheduler interval
+    scheduler.interval_minutes = new_interval
+    
+    # If monitoring is active, restart with new interval
+    was_running = scheduler.is_active()
+    current_target = scheduler.target_user
+    
+    if was_running:
+        scheduler.stop()
+        await asyncio.sleep(1)  # Brief pause
+        await scheduler.start(current_target)
+    
+    await callback_query.message.edit_text(
+        f"✅ **Interval Updated**\n\n"
+        f"New monitoring interval: **{new_interval} minutes**\n\n"
+        f"{'📡 Monitoring restarted with new interval.' if was_running else '⏸️ Apply when monitoring starts.'}\n\n"
+        f"⏰ Next check: {new_interval} minutes from now",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(lambda c: c.data == "monitoring_status")
+async def process_monitoring_status_callback(callback_query: types.CallbackQuery):
+    """Show monitoring status"""
+    await callback_query.answer()
+    
+    status = scheduler.get_status()
+    
+    if status['is_running']:
+        status_text = f"🟢 **Active**\n"
+        status_text += f"**Target:** @{status['target_user']}\n"
+        status_text += f"**Interval:** {status['interval_minutes']} minutes\n"
+        if status['last_run']:
+            status_text += f"**Last check:** {status['last_run'][:19]} UTC\n"
+        status_text += f"**Bot connected:** {'✅' if status['has_bot'] else '❌'}\n"
+        status_text += f"**Notifications:** {'✅' if status['has_chat_id'] else '❌'}\n"
+        status_text += f"**Task active:** {'✅' if status['task_active'] else '❌'}"
+    else:
+        status_text = "🔴 **Inactive**\nNo monitoring currently running."
+    
+    await callback_query.message.edit_text(
+        f"📊 **Monitoring Status**\n\n{status_text}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh", callback_data="monitoring_status")],
+            [InlineKeyboardButton(text="🔙 Main Menu", callback_data="action:main_menu")]
+        ]),
+        parse_mode="Markdown"
+    )
+
 async def on_startup():
     """Startup actions"""
     # Create database tables
     create_db_and_tables()
-    
-    # Reinitialize TwitterAPI with current proxy configuration
-    initialize_globals()
     
     # Log proxy status
     proxy_accounts = get_proxy_accounts()
@@ -930,8 +1303,8 @@ async def on_startup():
 async def on_shutdown():
     """Shutdown actions"""
     # Stop tracking job
-    if tracker:
-        tracker.stop()
+    if scheduler:
+        scheduler.stop()
     logging.info("Bot stopped")
 
 # Register startup and shutdown handlers

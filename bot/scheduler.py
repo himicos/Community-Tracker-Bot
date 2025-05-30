@@ -146,7 +146,13 @@ class CommunityScheduler:
         Args:
             user_id: Twitter user ID or handle
         """
+        self.logger.info(f"🚀 ====== NEW MONITORING RUN STARTED ======")
+        self.logger.info(f"🎯 Target User: @{user_id}")
+        self.logger.info(f"🕐 Run Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        self.logger.info(f"⏰ Interval: {self.interval_minutes} minutes")
+        self.logger.info(f"📊 Previous Run: {self.last_run.strftime('%Y-%m-%d %H:%M:%S') if self.last_run else 'Never'} UTC")
         self.logger.info(f"🔍 Starting enhanced community check for {user_id}")
+        
         self.last_run = datetime.utcnow()
         
         # Get saved cookies for authentication
@@ -196,17 +202,20 @@ class CommunityScheduler:
             self.logger.info(f"🎯 Starting enhanced community tracking for @{user_id}")
             
             # Initialize enhanced tracker if not available
-            if not hasattr(self.twitter_api, 'enhanced_tracker'):
-                from bot.enhanced_community_tracker import EnhancedCommunityTracker
-                self.twitter_api.enhanced_tracker = EnhancedCommunityTracker(
-                    self.twitter_api.api, self.twitter_api.cookie_manager
-                )
+            # Force reinitialize to ensure we use V2 tracker
+            if hasattr(self.twitter_api, 'enhanced_tracker'):
+                delattr(self.twitter_api, 'enhanced_tracker')
+            
+            from bot.enhanced_community_tracker_v2 import EnhancedCommunityTrackerV2
+            self.twitter_api.enhanced_tracker = EnhancedCommunityTrackerV2(
+                self.twitter_api.api, self.twitter_api.cookie_manager
+            )
             
             # Use enhanced tracking with multiple detection methods
             changes = await self.twitter_api.enhanced_tracker.track_community_changes(
                 username=user_id,
                 previous_communities=previous_communities,
-                deep_scan=True  # Enable all detection methods
+                deep_scan=False  # Use lightweight monitoring for auto tracking
             )
             
             if changes.get('error'):
@@ -226,13 +235,35 @@ class CommunityScheduler:
                     )
                 return
             
-            # Calculate current communities
+            # Calculate current communities - FIX THE STRUCTURE
+            raw_changes = changes.get('changes', {})  # Get the actual changes structure
             current_communities = []
-            current_communities.extend(changes.get('joined', []))
-            current_communities.extend(changes.get('created', []))
+            
+            # Get joined communities from the correct structure  
+            joined_communities = raw_changes.get('joined', [])
+            for change in joined_communities:
+                if hasattr(change, 'get') and 'community' in change:
+                    current_communities.append(change['community'])
+                else:
+                    current_communities.append(change)
+            
+            # Get created communities
+            created_communities = raw_changes.get('created', [])
+            for change in created_communities:
+                if hasattr(change, 'get') and 'community' in change:
+                    current_communities.append(change['community'])
+                else:
+                    current_communities.append(change)
             
             # Add previous communities that weren't left
-            left_ids = {c.id for c in changes.get('left', [])}
+            left_communities = raw_changes.get('left', [])
+            left_ids = set()
+            for change in left_communities:
+                if hasattr(change, 'get') and 'community' in change:
+                    left_ids.add(change['community'].id)
+                else:
+                    left_ids.add(change.id)
+            
             remaining_previous = [c for c in previous_communities if c.id not in left_ids]
             current_communities.extend(remaining_previous)
             
@@ -240,7 +271,19 @@ class CommunityScheduler:
             self.logger.info(f"   • Detection methods used: {changes.get('detection_methods', [])}")
             self.logger.info(f"   • Previous communities: {len(previous_communities)}")
             self.logger.info(f"   • Current communities: {len(current_communities)}")
-            self.logger.info(f"   • Changes detected: {len(changes.get('joined', [])) + len(changes.get('left', [])) + len(changes.get('created', []))}")
+            self.logger.info(f"   • Changes detected: {len(joined_communities) + len(left_communities) + len(created_communities)}")
+            
+            # DEBUG: Log actual joined communities
+            if joined_communities:
+                self.logger.info(f"🔍 DEBUG: Joined communities list:")
+                for i, change in enumerate(joined_communities):
+                    if hasattr(change, 'get') and 'community' in change:
+                        community = change['community']
+                        self.logger.info(f"   {i+1}. {community.name} (ID: {community.id})")
+                    else:
+                        self.logger.info(f"   {i+1}. {change} (raw object)")
+            else:
+                self.logger.info(f"🔍 DEBUG: No joined communities found in raw_changes")
             
             # Log detected communities with confidence scores
             if current_communities:
@@ -285,27 +328,41 @@ class CommunityScheduler:
             self.logger.error(f"Error in change detection: {changes['error']}")
             return
         
-        # Extract change data
-        joined = changes.get('joined', [])
-        left = changes.get('left', [])
-        created = changes.get('created', [])
-        role_changes = changes.get('role_changes', [])
+        # Extract change data - FIX THE STRUCTURE
+        raw_changes = changes.get('changes', {})
+        joined = raw_changes.get('joined', [])
+        left = raw_changes.get('left', [])
+        created = raw_changes.get('created', [])
+        role_changes = raw_changes.get('role_changed', [])  # Note: role_changed not role_changes
         
         total_changes = len(joined) + len(left) + len(created) + len(role_changes)
         
+        # ALWAYS send a scan completion notification
         if total_changes == 0:
             self.logger.info(f"✅ No community changes detected for @{user_id}")
             
-            # Send periodic summary if no changes but communities exist
-            if len(all_communities) > 0 and self.chat_id:
-                # Send summary every 10th check (to avoid spam)
-                if hasattr(self, '_check_count'):
-                    self._check_count += 1
-                else:
-                    self._check_count = 1
+            if self.chat_id:
+                # Send simple scan completion notification
+                message = f"🔍 **Scan Completed**\n\n"
+                message += f"Target: @{user_id}\n"
+                message += f"Communities found: {len(all_communities)}\n"
                 
-                if self._check_count % 10 == 0:
-                    await self._send_periodic_summary(user_id, all_communities)
+                if len(all_communities) > 0:
+                    message += f"\n📋 **Current Communities:**\n"
+                    for i, community in enumerate(all_communities[:5], 1):
+                        message += f"   {i}. {community.name}\n"
+                    if len(all_communities) > 5:
+                        message += f"   ... and {len(all_communities) - 5} more\n"
+                else:
+                    message += f"\nNo communities detected.\n"
+                
+                message += f"\n⏰ Next scan in {self.interval_minutes} minutes"
+                
+                try:
+                    await self.bot.send_message(self.chat_id, message, parse_mode="Markdown")
+                    self.logger.info(f"📤 Scan completion notification sent for @{user_id}")
+                except Exception as e:
+                    self.logger.error(f"Error sending scan notification: {e}")
             
             return
         
@@ -324,13 +381,15 @@ class CommunityScheduler:
         # Joined communities
         if joined:
             message_parts.append(f"✅ **Joined Communities ({len(joined)}):**")
-            for community in joined[:5]:  # Limit to prevent message overflow
+            for change in joined[:5]:  # Limit to prevent message overflow
+                community = change['community']  # Extract Community object from dict
                 role_emoji = "👑" if community.role == "Admin" else "👤"
-                message_parts.append(f"   {role_emoji} {community.name}")
+                # Escape markdown characters in community name
+                safe_name = community.name.replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace(']', r'\]')
+                community_url = f"https://x.com/i/communities/{community.id}"
+                message_parts.append(f"   {role_emoji} **{safe_name}**")
+                message_parts.append(f"      Link: {community_url}")
                 message_parts.append(f"      Role: {community.role}")
-                if community.description and len(community.description) > 10:
-                    desc = community.description[:80] + "..." if len(community.description) > 80 else community.description
-                    message_parts.append(f"      Info: {desc}")
             
             if len(joined) > 5:
                 message_parts.append(f"   ... and {len(joined) - 5} more")
@@ -339,12 +398,14 @@ class CommunityScheduler:
         # Created communities
         if created:
             message_parts.append(f"🆕 **Created Communities ({len(created)}):**")
-            for community in created[:3]:  # Fewer for created since they're more important
-                message_parts.append(f"   👑 {community.name}")
+            for change in created[:3]:  # Fewer for created since they're more important
+                community = change['community']  # Extract Community object from dict
+                # Escape markdown characters in community name
+                safe_name = community.name.replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace(']', r'\]')
+                community_url = f"https://x.com/i/communities/{community.id}"
+                message_parts.append(f"   👑 **{safe_name}**")
+                message_parts.append(f"      Link: {community_url}")
                 message_parts.append(f"      Role: {community.role}")
-                if community.description and len(community.description) > 10:
-                    desc = community.description[:80] + "..." if len(community.description) > 80 else community.description
-                    message_parts.append(f"      Info: {desc}")
             
             if len(created) > 3:
                 message_parts.append(f"   ... and {len(created) - 3} more")
@@ -353,8 +414,13 @@ class CommunityScheduler:
         # Left communities
         if left:
             message_parts.append(f"❌ **Left Communities ({len(left)}):**")
-            for community in left[:5]:
-                message_parts.append(f"   🚪 {community.name}")
+            for change in left[:5]:
+                community = change['community']  # Extract Community object from dict
+                # Escape markdown characters in community name
+                safe_name = community.name.replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace(']', r'\]')
+                community_url = f"https://x.com/i/communities/{community.id}"
+                message_parts.append(f"   🚪 **{safe_name}**")
+                message_parts.append(f"      Link: {community_url}")
                 message_parts.append(f"      Previous role: {community.role}")
             
             if len(left) > 5:
@@ -402,13 +468,60 @@ class CommunityScheduler:
             
             # Try sending without markdown if formatting fails
             try:
-                simple_message = f"Community changes detected for @{user_id}:\n"
-                simple_message += f"Joined: {len(joined)}, Left: {len(left)}, Created: {len(created)}, Role changes: {len(role_changes)}"
+                simple_message = f"🔔 **Community Changes Detected for @{user_id}**\n\n"
                 
-                await self.bot.send_message(self.chat_id, simple_message)
+                if joined:
+                    simple_message += f"✅ **Joined {len(joined)} Communities:**\n"
+                    for change in joined[:5]:
+                        community = change['community']
+                        community_url = f"https://x.com/i/communities/{community.id}"
+                        simple_message += f"• {community.name}\n"
+                        simple_message += f"  Link: {community_url}\n"
+                        simple_message += f"  Role: {community.role}\n\n"
+                
+                if created:
+                    simple_message += f"🆕 **Created {len(created)} Communities:**\n"
+                    for change in created[:3]:
+                        community = change['community']
+                        community_url = f"https://x.com/i/communities/{community.id}"
+                        simple_message += f"• {community.name}\n"
+                        simple_message += f"  Link: {community_url}\n"
+                        simple_message += f"  Role: {community.role}\n\n"
+                
+                if left:
+                    simple_message += f"❌ **Left {len(left)} Communities:**\n"
+                    for change in left[:5]:
+                        community = change['community']
+                        community_url = f"https://x.com/i/communities/{community.id}"
+                        simple_message += f"• {community.name}\n"
+                        simple_message += f"  Link: {community_url}\n\n"
+                
+                simple_message += f"📊 **Summary:** Joined: {len(joined)}, Left: {len(left)}, Created: {len(created)}, Role changes: {len(role_changes)}\n"
+                simple_message += f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                
+                await self.bot.send_message(self.chat_id, simple_message, parse_mode="Markdown")
+                self.logger.info(f"📤 Fallback notification sent for @{user_id}")
                 
             except Exception as e2:
-                self.logger.error(f"Error sending simple notification: {e2}")
+                self.logger.error(f"Error sending fallback notification: {e2}")
+                
+                # Final fallback - plain text
+                try:
+                    plain_message = f"Community changes detected for @{user_id}:\n"
+                    plain_message += f"Joined: {len(joined)}, Left: {len(left)}, Created: {len(created)}, Role changes: {len(role_changes)}\n\n"
+                    
+                    if joined:
+                        plain_message += "Joined Communities:\n"
+                        for change in joined[:3]:
+                            community = change['community']
+                            plain_message += f"- {community.name} (Role: {community.role})\n"
+                            plain_message += f"  https://x.com/i/communities/{community.id}\n"
+                    
+                    await self.bot.send_message(self.chat_id, plain_message)
+                    self.logger.info(f"📤 Plain text notification sent for @{user_id}")
+                    
+                except Exception as e3:
+                    self.logger.error(f"All notification methods failed: {e3}")
     
     async def _send_periodic_summary(self, user_id: str, communities: List):
         """Send periodic summary of current community state"""

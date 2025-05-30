@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Keyboard Utilities Module
+Keyboard Utilities Module - Enhanced for Element-Based Detection
 
 Utilities for creating Telegram inline keyboards:
 - Main menu keyboards
@@ -8,7 +8,7 @@ Utilities for creating Telegram inline keyboards:
 - Dynamic keyboards based on data
 """
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from typing import List, Any
 

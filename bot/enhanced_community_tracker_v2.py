@@ -66,37 +66,106 @@ class EnhancedCommunityTrackerV2:
                 self.logger.error(f"User @{username} not found")
                 return None
             
-            self.logger.info(f"Found user: {user.displayname} (@{user.username}, ID: {user.id})")
+            display_name = getattr(user, 'display_name', getattr(user, 'name', username))
+            self.logger.info(f"Found user: {display_name} (@{user.username}, ID: {user.id})")
+            
+            # Method 0: Direct API Community Detection (MOST RELIABLE)
+            try:
+                api_communities = await self.detector.get_communities_from_tweet_objects(user.id, max_tweets=20)
+                communities.extend(api_communities)
+                self.logger.info(f"🎯 Direct API detection found {len(api_communities)} communities")
+            except Exception as e:
+                self.logger.debug(f"Direct API detection failed: {e}")
             
             # Get actual current communities using multiple detection methods
-            all_communities = []
+            communities = []
             
             if deep_scan:
                 self.logger.info("🔍 Using comprehensive community detection")
                 
-                # Method 1: URL extraction from tweets (most reliable)
-                url_communities = await self.detector.get_communities_from_urls(user.id)
-                all_communities.extend(url_communities)
+                # Method 1: Browser automation - Direct community detection (MOST IMPORTANT)
+                self.logger.info(f"🌐 Using browser automation for direct community detection")
+                try:
+                    # Method 1A: Selenium-based HTML Element Detection (for socialContext, CSS elements)
+                    try:
+                        from bot.selenium_community_detector import SeleniumCommunityDetector
+                        selenium_detector = SeleniumCommunityDetector(self.cookie_manager)
+                        
+                        # Use the same cookie selection logic as scheduler
+                        saved_cookies = self.cookie_manager.list_cookie_sets()
+                        if saved_cookies:
+                            cookie_name = saved_cookies[0]['name']  # Most recent cookie set
+                        else:
+                            cookie_name = "default"
+                        
+                        self.logger.info(f"🌐 Using Selenium detector with cookie: {cookie_name}")
+                        html_detections = await selenium_detector.detect_communities(username, cookie_name)
+                        
+                        # Convert SeleniumCommunityDetector results to Community objects
+                        for detection in html_detections:
+                            community = Community(
+                                id=detection.community_id,
+                                name=detection.name,
+                                description="",
+                                member_count=0,
+                                is_nsfw=False,
+                                theme="selenium_detected",
+                                created_at=None,
+                                admin_id="",
+                                role="Member",  # Default role
+                                joined_at=None
+                            )
+                            communities.append(community)
+                        
+                        self.logger.info(f"🎯 Selenium HTML Detection found {len(html_detections)} communities (socialContext, CSS elements)")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Selenium detection failed: {e}")
+                        import traceback
+                        self.logger.error(f"Selenium detection traceback: {traceback.format_exc()}")
+                    
+                    # Method 1B: Text-based URL detection (backup)
+                    url_communities = await self.detector.get_communities_from_urls(user.id, max_tweets=10)
+                    communities.extend(url_communities)
+                    self.logger.info(f"🌐 Text URL scanning found {len(url_communities)} communities")
+                    
+                    # Method 1C: Profile-based communities from browser detection
+                    profile_communities = await self.detector.get_communities_from_profile(user)
+                    communities = self.diff_analyzer.merge_community_lists(communities, profile_communities)
+                    self.logger.info(f"🌐 Profile analysis found {len(profile_communities)} communities")
+                    
+                except Exception as e:
+                    self.logger.debug(f"Browser automation failed: {e}")
                 
                 # Method 2: Profile analysis for community links
-                profile_communities = await self.detector.get_communities_from_profile(user)
-                all_communities = self.diff_analyzer.merge_community_lists(all_communities, profile_communities)
+                self.logger.info(f"👤 Analyzing profile for community indicators")
+                try:
+                    if user.description:
+                        profile_communities = self.analyzer._extract_communities_from_text(user.description, confidence=0.8)
+                        communities.extend(profile_communities)
+                        self.logger.info(f"👤 Profile analysis found {len(profile_communities)} communities")
+                except Exception as e:
+                    self.logger.debug(f"Profile analysis failed: {e}")
                 
                 # Method 3: Post-based community tracking (creation/joining detection)
                 post_communities = await self.post_tracker.detect_community_activities(user.id, hours_lookback=24)
-                all_communities = self.diff_analyzer.merge_community_lists(all_communities, post_communities)
+                communities = self.diff_analyzer.merge_community_lists(communities, post_communities)
+                self.logger.info(f"📝 Post analysis found {len(post_communities)} communities")
                 
                 # Method 4: Social graph analysis
                 social_communities = await self.detector.detect_via_social_graph(user.id)
-                all_communities = self.diff_analyzer.merge_community_lists(all_communities, social_communities)
+                communities = self.diff_analyzer.merge_community_lists(communities, social_communities)
+                self.logger.info(f"👥 Social graph analysis found {len(social_communities)} communities")
                 
                 # Method 5: Activity pattern analysis
                 activity_communities = await self.analyzer.detect_via_activity_patterns(user.id)
-                all_communities = self.diff_analyzer.merge_community_lists(all_communities, activity_communities)
+                communities = self.diff_analyzer.merge_community_lists(communities, activity_communities)
+                self.logger.info(f"📊 Activity pattern analysis found {len(activity_communities)} communities")
                 
                 # Method 6: Content analysis
                 content_communities = await self.analyzer.detect_via_content_analysis(user.id)
-                all_communities = self.diff_analyzer.merge_community_lists(all_communities, content_communities)
+                communities = self.diff_analyzer.merge_community_lists(communities, content_communities)
+                self.logger.info(f"📊 Content analysis found {len(content_communities)} communities")
                 
             else:
                 self.logger.info("⚡ Using fast community detection")
@@ -104,12 +173,12 @@ class EnhancedCommunityTrackerV2:
                 # Just use the most reliable methods
                 url_communities = await self.detector.get_communities_from_urls(user.id)
                 post_communities = await self.post_tracker.detect_community_activities(user.id, hours_lookback=12)
-                all_communities = self.diff_analyzer.merge_community_lists(url_communities, post_communities)
+                communities = self.diff_analyzer.merge_community_lists(url_communities, post_communities)
             
-            self.logger.info(f"📊 Total current communities found: {len(all_communities)}")
+            self.logger.info(f"📊 Total current communities found: {len(communities)}")
             
             # Log each community with details
-            for i, community in enumerate(all_communities, 1):
+            for i, community in enumerate(communities, 1):
                 confidence = getattr(community, 'confidence', 'N/A')
                 theme = getattr(community, 'theme', 'unknown')
                 self.logger.info(f"  {i}. {community.name} (ID: {community.id}, Role: {community.role}, Theme: {theme}, Confidence: {confidence})")
@@ -121,7 +190,7 @@ class EnhancedCommunityTrackerV2:
                 verified=getattr(user, 'verified', False),
                 is_blue_verified=getattr(user, 'blue_verified', False),
                 profile_image_url_https=getattr(user, 'profileImageUrl', ''),
-                communities=all_communities
+                communities=communities
             )
             
         except Exception as e:
@@ -130,53 +199,64 @@ class EnhancedCommunityTrackerV2:
     
     async def track_community_changes(self, username: str, previous_communities: List[Community], deep_scan: bool = True) -> Dict[str, Any]:
         """
-        Track community changes for a user using enhanced detection methods
+        Track community changes with enhanced detection methods
         
         Args:
-            username: Twitter username (without @)
-            previous_communities: List of previously detected communities
-            deep_scan: Whether to use deep scanning methods
-            
-        Returns:
-            Dict containing change detection results
+            username: Twitter username
+            previous_communities: Previously detected communities
+            deep_scan: If True, uses comprehensive detection. If False, uses lightweight monitoring
         """
         self.logger.info(f"🔄 Tracking community changes for @{username} (Previous: {len(previous_communities)} communities)")
         
         try:
-            # Get current communities
-            current_payload = await self.get_all_user_communities(username, deep_scan=deep_scan)
-            if not current_payload:
+            # For monitoring (not deep_scan), use lightweight detection
+            if not deep_scan:
+                self.logger.info(f"⚡ Using lightweight monitoring mode for @{username}")
+                current_communities = await self._get_communities_lightweight_monitoring(username)
+            else:
+                self.logger.info(f"🔍 Getting current Twitter Communities for @{username} (Deep scan: {deep_scan})")
+                current_communities = await self.get_current_communities_comprehensive(username)
+            
+            if not current_communities:
+                self.logger.warning(f"No current communities found for @{username}")
                 return {
-                    'success': False,
-                    'error': 'Failed to get current communities',
-                    'changes': {},
-                    'summary': 'Error occurred during community detection'
+                    'success': True,
+                    'changes': {'joined': [], 'left': [], 'created': [], 'role_changes': []},
+                    'summary': 'No communities detected'
                 }
             
-            current_communities = current_payload.communities
+            # Calculate differences
+            diff = self.diff_analyzer.calculate_differences(previous_communities, current_communities)
             
-            # Enhanced change detection using multiple methods
+            # Enhanced change detection for additional insights
             enhanced_changes = await self._detect_enhanced_changes(username, previous_communities, current_communities)
             
-            # Detailed difference analysis
-            diff = self.diff_analyzer.detailed_community_diff(previous_communities, current_communities)
-            
-            # Filter high-confidence changes
-            filtered_diff = self.diff_analyzer.filter_high_confidence_changes(diff, min_confidence=0.6)
+            # Filter and validate changes
+            if deep_scan:
+                # Only apply confidence filtering for deep scans
+                filtered_diff = self.diff_analyzer.filter_and_validate_changes(diff)
+            else:
+                # For lightweight monitoring (Selenium), trust all detections
+                filtered_diff = diff
+                self.logger.info(f"🎯 Bypassing confidence filter for lightweight monitoring")
             
             # Calculate confidence score
-            confidence_score = self.diff_analyzer.calculate_confidence_score(current_communities)
+            if deep_scan:
+                confidence_score = self.diff_analyzer.calculate_change_confidence(filtered_diff, enhanced_changes)
+            else:
+                # For lightweight monitoring, use high confidence since we trust Selenium
+                confidence_score = 0.95 if any(len(changes) > 0 for changes in filtered_diff.values()) else 0.0
             
             # Generate summary
-            summary = self.diff_analyzer.generate_change_summary(filtered_diff)
+            total_changes = sum(len(changes) for changes in filtered_diff.values())
+            summary = f"Found {len(current_communities)} communities, {total_changes} changes detected"
             
-            # Compile result
             result = {
                 'success': True,
                 'user': {
                     'username': username,
-                    'display_name': current_payload.name,
-                    'user_id': current_payload.user_id
+                    'display_name': current_payload.name if 'current_payload' in locals() else username,
+                    'user_id': getattr(current_payload, 'user_id', None) if 'current_payload' in locals() else None
                 },
                 'detection_methods': enhanced_changes.get('methods_used', []),
                 'changes': filtered_diff,
@@ -184,7 +264,7 @@ class EnhancedCommunityTrackerV2:
                 'enhanced_detections': enhanced_changes.get('new_detections', []),
                 'confidence_score': confidence_score,
                 'summary': summary,
-                'scan_type': 'deep' if deep_scan else 'quick',
+                'scan_type': 'deep' if deep_scan else 'lightweight_monitoring',
                 'timestamp': datetime.now().isoformat(),
                 'total_current_communities': len(current_communities),
                 'total_previous_communities': len(previous_communities)
@@ -207,75 +287,86 @@ class EnhancedCommunityTrackerV2:
                 'summary': f'Error tracking changes: {str(e)}'
             }
     
-    async def _detect_enhanced_changes(self, username: str, previous_communities: List[Community], current_communities: List[Community]) -> Dict[str, Any]:
+    async def _get_communities_lightweight_monitoring(self, username: str) -> List[Community]:
         """
-        Enhanced change detection using multiple analysis methods
+        Lightweight community detection for monitoring - SELENIUM ONLY
+        
+        Simple approach:
+        1. Selenium detection (finds the actual HTML elements)
+        2. Report findings
+        3. Schedule next check
+        4. Done - no excessive scanning
         """
-        enhanced_result = {
-            'methods_used': [],
-            'new_detections': []
-        }
+        self.logger.info(f"⚡ Lightweight Selenium-only monitoring for @{username}")
+        communities = []
         
         try:
-            # Method 1: Post-based activity analysis
+            # Get user info
+            user = await self.api.user_by_login(username)
+            if not user:
+                self.logger.error(f"User @{username} not found")
+                return []
+
+            display_name = getattr(user, 'display_name', getattr(user, 'name', username))
+            self.logger.info(f"Found user: {display_name} (@{user.username}, ID: {user.id})")
+            
+            # ONLY Method: Selenium-based HTML Element Detection
             try:
-                post_detections = await self.analyzer.detect_communities_via_enhanced_activity(username, previous_communities)
-                if post_detections:
-                    enhanced_result['methods_used'].append('post_analysis')
-                    enhanced_result['new_detections'].extend(post_detections)
-                    self.logger.info(f"📝 Post analysis found {len(post_detections)} additional community indicators")
+                from bot.selenium_community_detector import SeleniumCommunityDetector
+                selenium_detector = SeleniumCommunityDetector(self.cookie_manager)
+                
+                # Use the same cookie selection logic as scheduler
+                saved_cookies = self.cookie_manager.list_cookie_sets()
+                if saved_cookies:
+                    cookie_name = saved_cookies[0]['name']  # Most recent cookie set
+                else:
+                    cookie_name = "default"
+                
+                self.logger.info(f"🌐 Using Selenium detector with cookie: {cookie_name}")
+                html_detections = await selenium_detector.detect_communities(username, cookie_name)
+                
+                # Convert SeleniumCommunityDetector results to Community objects
+                for detection in html_detections:
+                    community = Community(
+                        id=detection.community_id,
+                        name=detection.name,
+                        description="",
+                        member_count=0,
+                        is_nsfw=False,
+                        theme="selenium_detected",
+                        created_at=None,
+                        admin_id="",
+                        role="Member",  # Default role
+                        joined_at=None
+                    )
+                    communities.append(community)
+                
+                self.logger.info(f"🎯 Selenium detection found {len(html_detections)} communities")
+                
             except Exception as e:
-                self.logger.debug(f"Post analysis failed: {e}")
+                self.logger.error(f"Selenium detection failed: {e}")
             
-            # Method 2: Temporal pattern analysis (analyze recent activity for community events)
-            try:
-                user = await self.api.user_by_login(username)
-                if user:
-                    tweets = []
-                    async for tweet in self.api.user_tweets(user.id, limit=50):
-                        tweets.append(tweet)
-                        if len(tweets) >= 50:
-                            break
-                    
-                    if tweets:
-                        temporal_communities = await self.analyzer._analyze_temporal_patterns(tweets)
-                        if temporal_communities:
-                            enhanced_result['methods_used'].append('temporal_analysis')
-                            enhanced_result['new_detections'].extend(temporal_communities)
-                            self.logger.info(f"⏰ Temporal analysis found {len(temporal_communities)} community indicators")
-            except Exception as e:
-                self.logger.debug(f"Temporal analysis failed: {e}")
+            # Remove duplicates (simple)
+            unique_communities = []
+            for community in communities:
+                if not any(c.id == community.id for c in unique_communities):
+                    unique_communities.append(community)
             
-            # Method 3: Post tracker creation/joining detection
-            try:
-                user = await self.api.user_by_login(username)
-                if user:
-                    creation_detections = await self.post_tracker.detect_community_creation(user.id, hours_lookback=24)
-                    joining_detections = await self.post_tracker.detect_community_joining(user.id, hours_lookback=24)
-                    
-                    all_post_detections = creation_detections + joining_detections
-                    if all_post_detections:
-                        enhanced_result['methods_used'].append('creation_joining_detection')
-                        enhanced_result['new_detections'].extend(all_post_detections)
-                        self.logger.info(f"🆕 Creation/joining analysis found {len(all_post_detections)} community activities")
-            except Exception as e:
-                self.logger.debug(f"Creation/joining detection failed: {e}")
-            
-            # Remove duplicates from enhanced detections
-            unique_detections = []
-            for detection in enhanced_result['new_detections']:
-                if not self.diff_analyzer.is_duplicate_community(detection, unique_detections):
-                    unique_detections.append(detection)
-            
-            enhanced_result['new_detections'] = unique_detections
-            
-            self.logger.info(f"🔍 Enhanced detection methods used: {', '.join(enhanced_result['methods_used'])}")
-            self.logger.info(f"🔍 Enhanced detections found: {len(enhanced_result['new_detections'])}")
+            self.logger.info(f"⚡ Lightweight monitoring complete: {len(unique_communities)} unique communities")
+            return unique_communities
             
         except Exception as e:
-            self.logger.error(f"Error in enhanced change detection: {e}")
-        
-        return enhanced_result
+            self.logger.error(f"Error in lightweight monitoring for @{username}: {e}")
+            return []
+    
+    async def _detect_enhanced_changes(self, username: str, previous_communities: List[Community], current_communities: List[Community]) -> Dict[str, Any]:
+        """
+        SIMPLIFIED - No enhanced detection, just return empty results
+        """
+        return {
+            'methods_used': ['selenium_only'],
+            'new_detections': []
+        }
     
     async def get_community_creation_activities(self, username: str, hours_lookback: int = 24) -> List[Community]:
         """

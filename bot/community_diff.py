@@ -319,6 +319,10 @@ class CommunityDifferenceAnalyzer:
         try:
             theme = getattr(community, 'theme', '').lower()
             
+            # Selenium-based detection is HIGHEST confidence (real HTML elements)
+            if 'selenium' in theme:
+                return 0.95
+            
             # URL-based detection is most reliable
             if 'url' in theme or 'direct' in theme:
                 return 0.9
@@ -395,4 +399,60 @@ class CommunityDifferenceAnalyzer:
         
         except Exception as e:
             self.logger.error(f"Error generating change summary: {e}")
-            return "Error generating summary" 
+            return "Error generating summary"
+    
+    def calculate_differences(self, previous_communities: List[Community], current_communities: List[Community]) -> Dict[str, List]:
+        """
+        Calculate differences between previous and current community lists
+        
+        Args:
+            previous_communities: List of previously detected communities
+            current_communities: List of currently detected communities
+            
+        Returns:
+            Dict with 'joined', 'left', 'created', and 'role_changes' lists
+        """
+        return self.detailed_community_diff(previous_communities, current_communities)
+    
+    def filter_and_validate_changes(self, diff: Dict[str, List]) -> Dict[str, List]:
+        """
+        Filter and validate detected changes for reliability
+        
+        Args:
+            diff: Raw differences dictionary
+            
+        Returns:
+            Filtered and validated differences
+        """
+        return self.filter_high_confidence_changes(diff, min_confidence=0.6)
+    
+    def calculate_change_confidence(self, filtered_diff: Dict[str, List], enhanced_changes: Dict[str, Any]) -> float:
+        """
+        Calculate confidence score for detected changes
+        
+        Args:
+            filtered_diff: Filtered differences
+            enhanced_changes: Enhanced detection results
+            
+        Returns:
+            Overall confidence score between 0.0 and 1.0
+        """
+        try:
+            all_communities = []
+            
+            # Collect all communities from changes
+            for change_list in filtered_diff.values():
+                for change in change_list:
+                    community = change.get('community')
+                    if community:
+                        all_communities.append(community)
+            
+            # Add enhanced detections
+            enhanced_detections = enhanced_changes.get('new_detections', [])
+            all_communities.extend(enhanced_detections)
+            
+            return self.calculate_confidence_score(all_communities)
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating change confidence: {e}")
+            return 0.5 

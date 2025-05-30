@@ -208,10 +208,10 @@ class DatabaseManager:
                         user_id,
                         community.id,
                         community.name,
-                        community.description,
-                        community.member_count,
+                        getattr(community, 'description', ''),  # Safe fallback for missing attribute
+                        getattr(community, 'member_count', 0),
                         community.role,
-                        community.is_nsfw,
+                        getattr(community, 'is_nsfw', False),
                         "enhanced_tracking"
                     ))
                 

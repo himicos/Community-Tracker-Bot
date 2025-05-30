@@ -1,0 +1,6 @@
+# Browser-based Community Detection Requirements
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# Optional: For headless browser optimization
+undetected-chromedriver>=3.5.0 

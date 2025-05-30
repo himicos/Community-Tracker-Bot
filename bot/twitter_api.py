@@ -199,20 +199,18 @@ class TwitterAPI:
     
     async def get_user_communities_comprehensive(self, username: str, deep_scan: bool = True) -> Optional[TwitterUserCommunityPayload]:
         """
-        Get comprehensive community information using enhanced tracking
-        
-        Args:
-            username: Twitter username (without @)
-            deep_scan: Whether to perform deep analysis (slower but finds ALL communities)
-            
-        Returns:
-            Complete TwitterUserCommunityPayload with all detected communities
+        Get user's communities using comprehensive tracking with ALL available methods
+        Now uses REAL browser-based detection as primary method
         """
         self.logger.info(f"Starting comprehensive community tracking for @{username}")
         
         try:
-            # Use enhanced community tracker for comprehensive detection
-            result = await self.enhanced_tracker.get_all_user_communities(username, deep_scan=deep_scan)
+            # Use enhanced community tracker with BROWSER DETECTION for maximum accuracy
+            result = await self.enhanced_tracker.get_all_user_communities(
+                username, 
+                deep_scan=deep_scan, 
+                use_browser=True  # Enable REAL DOM-based detection
+            )
             
             if result:
                 self.logger.info(f"Comprehensive scan complete for @{username}: {len(result.communities)} communities found")
@@ -422,3 +420,44 @@ class TwitterAPI:
         created_ids = {c.id for c in new_communities if c.role == "Admin" and c.id in joined_ids}
         
         return list(joined_ids), list(left_ids), list(created_ids)
+
+    async def validate_user_and_auth(self, username: str) -> Optional[Dict[str, Any]]:
+        """
+        Fast validation that only checks if user exists and authentication works
+        Does NOT perform community scanning - just validates target and auth
+        
+        Args:
+            username: Twitter username (without @)
+            
+        Returns:
+            Dict with user info if successful, None if failed
+        """
+        self.logger.info(f"⚡ Fast validation for @{username} (auth check only)")
+        
+        try:
+            # Try to get basic user info using the API
+            user = await self.api.user_by_login(username)
+            
+            if not user:
+                self.logger.error(f"❌ User @{username} not found")
+                return None
+            
+            # Basic user data validation successful
+            user_data = {
+                'user_id': str(user.id),
+                'screen_name': user.username,
+                'name': user.displayname or user.username,
+                'verified': getattr(user, 'verified', False),
+                'is_blue_verified': getattr(user, 'blue_verified', False),
+                'profile_image_url_https': getattr(user, 'profileImageUrl', ''),
+                'followers_count': getattr(user, 'followersCount', 0),
+                'following_count': getattr(user, 'followingCount', 0),
+                'tweet_count': getattr(user, 'statusesCount', 0)
+            }
+            
+            self.logger.info(f"✅ Fast validation successful for @{username} (ID: {user.id})")
+            return user_data
+            
+        except Exception as e:
+            self.logger.error(f"❌ Fast validation failed for @{username}: {e}")
+            return None

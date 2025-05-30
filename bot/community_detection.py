@@ -26,28 +26,32 @@ class CommunityDetector:
         self.cookie_manager = cookie_manager
         self.logger = logging.getLogger(__name__)
     
-    async def get_communities_from_urls(self, user_id: int) -> List[Community]:
+    async def get_communities_from_urls(self, user_id: int, max_tweets: int = 10) -> List[Community]:
         """
         Get communities by extracting Community URLs from user's recent tweets
         This is currently the most reliable method
+        
+        Args:
+            user_id: Twitter user ID
+            max_tweets: Maximum number of recent tweets to scan (default: 10)
         """
         communities = []
         
         try:
-            # Get recent tweets to scan for community URLs
+            # Get recent tweets to scan for community URLs (limited to 10 for efficiency)
             tweets = []
             tweet_count = 0
-            async for tweet in self.api.user_tweets(user_id, limit=100):
+            async for tweet in self.api.user_tweets(user_id, limit=max_tweets):
                 tweets.append(tweet)
                 tweet_count += 1
-                if tweet_count >= 100:
+                if tweet_count >= max_tweets:
                     break
             
             if not tweets:
                 self.logger.info("No tweets found to scan for community URLs")
                 return communities
             
-            self.logger.info(f"🔍 Scanning {len(tweets)} tweets for Twitter Community URLs")
+            self.logger.info(f"🔍 Scanning {len(tweets)} recent tweets for Twitter Community URLs")
             
             # Extract community IDs from URLs
             community_ids = set()
@@ -166,18 +170,30 @@ class CommunityDetector:
     
     async def create_community_from_id(self, community_id: str, user_id: int) -> Optional[Community]:
         """
-        Create a Community object from a community ID
+        Create a Community object from a community ID with intelligent name resolution
         """
         try:
-            # For now, create a basic community object
-            # In the future, we could fetch more details from Twitter's API
+            # Known community mappings for better names
+            known_communities = {
+                '1493446837214187523': 'Build in Public',
+                # Add more as we discover them
+            }
+            
+            # Get community name
+            if community_id in known_communities:
+                community_name = known_communities[community_id]
+            else:
+                # Try to fetch community name from Twitter (placeholder for future implementation)
+                community_name = await self.fetch_community_name_from_twitter(community_id)
+                if not community_name:
+                    community_name = f"Community {community_id[:8]}..."
             
             # Determine user's role in the community
             role = await self.determine_user_role_in_community(community_id, user_id)
             
             community = Community(
                 id=community_id,
-                name=f"Community {community_id[:8]}...",  # Placeholder name
+                name=community_name,
                 description="",
                 member_count=0,
                 is_nsfw=False,
@@ -192,6 +208,20 @@ class CommunityDetector:
             
         except Exception as e:
             self.logger.error(f"Error creating community from ID {community_id}: {e}")
+            return None
+    
+    async def fetch_community_name_from_twitter(self, community_id: str) -> Optional[str]:
+        """
+        Try to fetch actual community name from Twitter API (future implementation)
+        """
+        try:
+            # This would make a GraphQL request to get community details
+            # For now, return None to use placeholder names
+            self.logger.debug(f"Community name lookup not implemented for ID: {community_id}")
+            return None
+            
+        except Exception as e:
+            self.logger.debug(f"Error fetching community name for {community_id}: {e}")
             return None
     
     async def determine_user_role_in_community(self, community_id: str, user_id: int) -> str:
@@ -426,4 +456,107 @@ class CommunityDetector:
         except Exception as e:
             self.logger.debug(f"Error extracting communities from user: {e}")
         
-        return communities 
+        return communities
+    
+    async def get_communities_from_tweet_objects(self, user_id: int, max_tweets: int = 10) -> List[Community]:
+        """
+        Extract community information directly from tweet objects (most reliable method)
+        
+        Each tweet object contains community metadata if posted to a community:
+        - tweet.community.id
+        - tweet.community.name  
+        - tweet.community.description
+        - etc.
+        
+        Args:
+            user_id: Twitter user ID
+            max_tweets: Maximum number of tweets to analyze
+            
+        Returns:
+            List of Community objects
+        """
+        communities = []
+        
+        try:
+            self.logger.info(f"🔍 Analyzing tweet objects for direct community metadata")
+            
+            tweet_count = 0
+            async for tweet in self.api.user_tweets(user_id, limit=max_tweets):
+                tweet_count += 1
+                
+                # DEBUG: Log tweet structure to understand what's available
+                self.logger.info(f"📊 Tweet {tweet_count} analysis:")
+                self.logger.info(f"   Tweet ID: {getattr(tweet, 'id', 'N/A')}")
+                self.logger.info(f"   Tweet content: {getattr(tweet, 'rawContent', 'N/A')[:100]}...")
+                
+                # Debug: Log all available attributes
+                available_attrs = [attr for attr in dir(tweet) if not attr.startswith('_')]
+                self.logger.info(f"   Available attributes: {available_attrs}")
+                
+                # Check for various community-related fields
+                community_fields = ['community', 'communities', 'communityResults', 'socialContext']
+                for field in community_fields:
+                    if hasattr(tweet, field):
+                        field_value = getattr(tweet, field)
+                        self.logger.info(f"   Found field '{field}': {field_value}")
+                
+                # Check if tweet has community metadata
+                if hasattr(tweet, 'community') and tweet.community:
+                    try:
+                        self.logger.info(f"🎯 Found community metadata: {tweet.community}")
+                        community = Community(
+                            id=str(tweet.community.id),
+                            name=tweet.community.name,
+                            description=getattr(tweet.community, 'description', ''),
+                            member_count=getattr(tweet.community, 'member_count', 0),
+                            is_nsfw=getattr(tweet.community, 'is_nsfw', False),
+                            theme=getattr(tweet.community, 'theme', 'unknown'),
+                            created_at=getattr(tweet.community, 'created_at', None),
+                            admin_id=getattr(tweet.community, 'admin_id', ''),
+                            role="Member",  # Default role
+                            joined_at=None
+                        )
+                        
+                        # Avoid duplicates
+                        if not any(c.id == community.id for c in communities):
+                            communities.append(community)
+                            self.logger.info(f"🎯 Found community from tweet metadata: {community.name} (ID: {community.id})")
+                    
+                    except Exception as e:
+                        self.logger.error(f"Error processing community metadata: {e}")
+                
+                # Also check tweet text for community links as backup
+                if hasattr(tweet, 'rawContent') and tweet.rawContent:
+                    community_urls = re.findall(r'https://(?:twitter\.com|x\.com)/i/communities/(\d+)', tweet.rawContent)
+                    for community_id in community_urls:
+                        # Create community object from URL
+                        if not any(c.id == community_id for c in communities):
+                            community = Community(
+                                id=community_id,
+                                name=f"Community {community_id[:8]}...",
+                                description="",
+                                member_count=0,
+                                is_nsfw=False,
+                                theme="url_detected",
+                                created_at=None,
+                                admin_id="",
+                                role="Member",
+                                joined_at=None
+                            )
+                            communities.append(community)
+                            self.logger.info(f"🔗 Found community from URL: {community.name} (ID: {community.id})")
+                
+                # DEBUG: Let's also check if there's any mention of "Build in Public" or similar
+                content = getattr(tweet, 'rawContent', '') or ''
+                if any(keyword in content.lower() for keyword in ['build in public', 'community', '1493446837214187523']):
+                    self.logger.info(f"🔍 Found potential community reference in tweet: {content[:200]}...")
+                
+                if tweet_count >= max_tweets:
+                    break
+            
+            self.logger.info(f"📊 Direct API community detection found {len(communities)} communities from {tweet_count} tweets")
+            return communities
+            
+        except Exception as e:
+            self.logger.error(f"Error in direct community detection: {e}")
+            return [] 

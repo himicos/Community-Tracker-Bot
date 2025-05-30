@@ -165,14 +165,27 @@ class CommunityPostTracker:
         count = 0
         
         try:
+            # Ensure cutoff_time is timezone-aware
+            if cutoff_time.tzinfo is None:
+                # Make cutoff_time timezone-aware (UTC)
+                from datetime import timezone
+                cutoff_time = cutoff_time.replace(tzinfo=timezone.utc)
+            
             async for tweet in self.api.user_tweets(user_id, limit=200):
                 count += 1
+                
+                # Get tweet date and ensure timezone consistency
+                tweet_date = tweet.date if hasattr(tweet, 'date') else datetime.now()
+                if tweet_date.tzinfo is None:
+                    # Make tweet_date timezone-aware (UTC)
+                    from datetime import timezone
+                    tweet_date = tweet_date.replace(tzinfo=timezone.utc)
                 
                 # Convert tweet to dictionary for easier processing
                 tweet_data = {
                     'id': tweet.id,
                     'content': tweet.rawContent if hasattr(tweet, 'rawContent') else str(tweet),
-                    'created_at': tweet.date if hasattr(tweet, 'date') else datetime.now(),
+                    'created_at': tweet_date,
                     'replies': getattr(tweet, 'replyCount', 0),
                     'retweets': getattr(tweet, 'retweetCount', 0),
                     'likes': getattr(tweet, 'likeCount', 0),
@@ -554,17 +567,17 @@ class CommunityPostTracker:
             if 'community_id' in indicator:
                 community_id = f"twitter_{indicator['community_id']}"
             
-            community = Community(
+            return Community(
                 id=community_id,
                 name=community_name,
+                description=f"Detected via post tracking: {indicator.get('pattern', 'Unknown pattern')}",
+                member_count=0,
                 role=default_role,
-                member_count=None,
-                description=f"Detected via {indicator['type']} pattern",
+                is_private=False,
                 created_at=indicator.get('timestamp', datetime.now()),
-                is_private=None
+                confidence=indicator.get('confidence', 0.5),
+                source=indicator.get('type', 'post_analysis')  # Add source attribute
             )
-            
-            return community
             
         except Exception as e:
             self.logger.error(f"Error creating community from indicator: {e}")
@@ -736,4 +749,28 @@ class CommunityPostTracker:
         except Exception as e:
             self.logger.error(f"Error detecting community joining: {e}")
         
-        return communities 
+        return communities
+
+    async def _detect_creation_activities(self, user_id: int, hours_lookback: int = 24) -> List[Community]:
+        """
+        Detect community creation activities for testing purposes
+        This is a wrapper around detect_community_creation for test compatibility
+        """
+        try:
+            self.logger.info(f"🆕 Detecting creation activities for user {user_id}")
+            return await self.detect_community_creation(user_id, hours_lookback)
+        except Exception as e:
+            self.logger.error(f"Error detecting creation activities: {e}")
+            return []
+    
+    async def _detect_joining_activities(self, user_id: int, hours_lookback: int = 24) -> List[Community]:
+        """
+        Detect community joining activities for testing purposes  
+        This is a wrapper around detect_community_joining for test compatibility
+        """
+        try:
+            self.logger.info(f"👥 Detecting joining activities for user {user_id}")
+            return await self.detect_community_joining(user_id, hours_lookback)
+        except Exception as e:
+            self.logger.error(f"Error detecting joining activities: {e}")
+            return [] 
